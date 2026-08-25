@@ -1,0 +1,10 @@
+{
+  "name": "tsk-admin-v1",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install": "npm --prefix frontend install --legacy-peer-deps",
+    "build": "npm --prefix frontend run build",
+    "start": "npm --prefix frontend start"
+  }
+}
