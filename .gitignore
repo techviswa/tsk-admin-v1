@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Environment / secrets
+.env
+*.env
+backend/.env
+frontend/.env
+*token.json*
+*credentials.json*
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Builds and coverage
+build/
+frontend/build/
+dist/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Local databases and runtime data
+backend/mongo-data/
+dump.rdb
+memory/test_credentials.md
+test_reports/
+
+# IDE/system
+.idea/
+.vscode/
+.DS_Store
+
+# Archives / large binaries
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.pack
+*.deb
+*.dylib

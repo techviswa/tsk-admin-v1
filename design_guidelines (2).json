@@ -1,0 +1,150 @@
+{
+  "theme": "Light",
+  "archetype": "4 - Swiss & High-Contrast",
+  "domain": "Enterprise Business Admin Panel / SaaS",
+  "colors": {
+    "background": {
+      "page": "#F4F4F5",
+      "surface": "#FFFFFF",
+      "surface_hover": "#F9FAFB",
+      "glass": "rgba(255, 255, 255, 0.85)"
+    },
+    "text": {
+      "primary": "#09090B",
+      "secondary": "#52525B",
+      "tertiary": "#A1A1AA",
+      "disabled": "#D4D4D8"
+    },
+    "border": {
+      "default": "#E4E4E7",
+      "focus": "#18181B"
+    },
+    "brand": {
+      "primary": "#0055FF",
+      "primary_hover": "#004CE6",
+      "primary_active": "#0040C2",
+      "primary_light": "#E6F0FF",
+      "primary_text": "#0055FF"
+    },
+    "semantic": {
+      "success_bg": "#ECFDF5",
+      "success_text": "#059669",
+      "warning_bg": "#FFFBEB",
+      "warning_text": "#D97706",
+      "error_bg": "#FEF2F2",
+      "error_text": "#DC2626",
+      "info_bg": "#F0F9FF",
+      "info_text": "#0284C7"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "headings": "Outfit, sans-serif",
+      "body": "Inter, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "scale": {
+      "h1": "text-4xl tracking-tight font-semibold text-zinc-950",
+      "h2": "text-2xl tracking-tight font-medium text-zinc-900",
+      "h3": "text-lg font-medium text-zinc-900",
+      "body": "text-sm text-zinc-600 leading-relaxed",
+      "label": "text-xs font-medium uppercase tracking-wider text-zinc-500",
+      "data": "text-sm font-medium text-zinc-900"
+    }
+  },
+  "layout": {
+    "shell": {
+      "type": "sidebar-with-topnav",
+      "top_nav": "h-14 fixed top-0 w-full bg-white/85 backdrop-blur-md border-b border-zinc-200 z-50 flex items-center px-4 md:px-6",
+      "sidebar": "fixed left-0 top-14 w-64 h-[calc(100vh-3.5rem)] bg-zinc-50 border-r border-zinc-200 flex flex-col overflow-y-auto hidden md:flex",
+      "main_content": "pt-14 md:pl-64 min-h-screen bg-zinc-50/50"
+    },
+    "container": "max-w-7xl mx-auto p-4 md:p-8 space-y-8",
+    "grids": {
+      "dashboard_overview": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4",
+      "settings_layout": "grid grid-cols-1 lg:grid-cols-4 gap-8",
+      "bento_features": "grid grid-cols-1 md:grid-cols-3 gap-6"
+    },
+    "surfaces": {
+      "card": "bg-white border border-zinc-200 rounded-lg shadow-sm transition-shadow duration-200 hover:shadow-md",
+      "card_header": "px-6 py-4 border-b border-zinc-100 flex items-center justify-between",
+      "card_body": "p-6",
+      "table_container": "bg-white border border-zinc-200 rounded-lg overflow-hidden w-full",
+      "panel": "bg-white p-6 md:p-8 rounded-xl border border-zinc-200 shadow-sm"
+    }
+  },
+  "components": {
+    "button": {
+      "primary": "bg-blue-600 text-white hover:bg-blue-700 rounded-md px-4 py-2 font-medium text-sm transition-colors shadow-sm",
+      "secondary": "bg-white border border-zinc-200 text-zinc-700 hover:bg-zinc-50 rounded-md px-4 py-2 font-medium text-sm transition-colors shadow-sm",
+      "danger": "bg-red-600 text-white hover:bg-red-700 rounded-md px-4 py-2 font-medium text-sm transition-colors shadow-sm",
+      "ghost": "hover:bg-zinc-100 text-zinc-600 rounded-md px-4 py-2 font-medium text-sm transition-colors"
+    },
+    "inputs": {
+      "base": "h-9 w-full rounded-md border border-zinc-200 bg-white px-3 py-1 text-sm shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+    },
+    "badge": {
+      "active": "px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-700 border border-emerald-200",
+      "inactive": "px-2 py-0.5 rounded-full text-xs font-medium bg-zinc-100 text-zinc-700 border border-zinc-200",
+      "role": "px-2 py-0.5 rounded-md text-xs font-medium bg-blue-50 text-blue-700 border border-blue-100"
+    },
+    "table": {
+      "header": "bg-zinc-50 text-left text-xs font-semibold text-zinc-500 uppercase tracking-wider py-3 px-4",
+      "row": "border-b border-zinc-200 hover:bg-zinc-50 transition-colors",
+      "cell": "py-3 px-4 text-sm text-zinc-700 whitespace-nowrap"
+    },
+    "shadcn_overrides": {
+      "TabsList": "bg-zinc-100/80 p-1 rounded-md text-zinc-500 h-auto",
+      "TabsTrigger": "data-[state=active]:bg-white data-[state=active]:text-zinc-950 data-[state=active]:shadow-sm rounded py-1.5 px-3 text-sm font-medium transition-all",
+      "Card": "shadow-sm border-zinc-200 rounded-lg",
+      "Sheet": "sm:max-w-xl",
+      "DropdownMenuContent": "border-zinc-200 shadow-md rounded-md"
+    }
+  },
+  "media": {
+    "logos": [
+      {
+        "url": "https://images.unsplash.com/photo-1633796212691-0cfba2ab1dab?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1Mjh8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGJ1c2luZXNzJTIwbG9nb3xlbnwwfHx8fDE3NzYxODEwMzJ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Tenant A Logo - Tech Startup"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1770591134725-02ae54b51756?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1Mjh8MHwxfHNlYXJjaHwyfHxhYnN0cmFjdCUyMGJ1c2luZXNzJTIwbG9nb3xlbnwwfHx8fDE3NzYxODEwMzJ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Tenant B Logo - Wellness Center"
+      }
+    ],
+    "avatars": [
+      {
+        "url": "https://images.unsplash.com/photo-1762522926157-bcc04bf0b10a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1OTV8MHwxfHNlYXJjaHwxfHxwcm9mZXNzaW9uYWwlMjBoZWFkc2hvdCUyMHBvcnRyYWl0fGVufDB8fHx8MTc3NjE4MTAzMXww&ixlib=rb-4.1.0&q=85",
+        "description": "Platform Admin Avatar"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1769636929388-99eff95d3bf1?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1OTV8MHwxfHNlYXJjaHwyfHxwcm9mZXNzaW9uYWwlMjBoZWFkc2hvdCUyMHBvcnRyYWl0fGVufDB8fHx8MTc3NjE4MTAzMXww&ixlib=rb-4.1.0&q=85",
+        "description": "Business Manager Avatar"
+      },
+      {
+        "url": "https://images.pexels.com/photos/32721688/pexels-photo-32721688.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Staff Member Avatar"
+      }
+    ]
+  },
+  "motion": {
+    "hover": "transition-all duration-200 ease-in-out",
+    "drawer_enter": "animate-in slide-in-from-right",
+    "dropdown_enter": "animate-in zoom-in-95 fade-in-0 duration-150",
+    "fade_in": "animate-in fade-in-0 duration-300"
+  },
+  "instructions_to_main_agent": [
+    "Use lucide-react for all icons (Dashboard, Store, Users, Settings, Shield, Package, Blocks, Activity).",
+    "Ensure 'Outfit' font is imported via Google Fonts for headings, and 'Inter' for body.",
+    "Implement Shadcn/UI for foundational components (Button, Input, Table, Badge, DropdownMenu, Tabs, Sheet, Switch).",
+    "The layout must have a sticky top navbar containing the Tenant Switcher Dropdown (for multi-tenant context) and a user profile dropdown.",
+    "The Sidebar must contain navigation for: Overview, Outlets, Modules (POS, Billing, Inventory, etc.), Users & Roles (RBAC), Settings, Integrations, Audit Logs.",
+    "For the Tenant/Business Dashboard, use the 'Control Room' grid (grid-cols-1 md:grid-cols-4) with high-density data widgets (e.g., Active Outlets, MRR, Active Users, System Status).",
+    "Use the Sheet component (Slide-over drawer) for 'Add New User', 'Edit Role', or 'Configure Module' instead of navigating to separate pages. This preserves context.",
+    "The Settings Engine should be a complex page utilizing Tabs (General, Branding, Modules, Feature Flags) and Switch toggles for enabling/disabling features per tenant.",
+    "Tables must be dense (py-2 px-4) with an actions column (3 dots DropdownMenu) at the end of each row. Use badges for Status (Active/Inactive) and Roles.",
+    "Seed realistic demo data using the provided avatars and logos in the media array. Do not use placeholder images like via.placeholder.com.",
+    "Ensure the MVP focuses heavily on Tenant Management, RBAC, Module Registry, and the Settings Engine.",
+    "Include data-testid attributes on all interactive elements (buttons, nav links, dropdown triggers, toggles) for testing, using kebab-case role-based names."
+  ]
+}
