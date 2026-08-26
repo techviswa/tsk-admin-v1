@@ -70,6 +70,14 @@ def create_refresh_token(user_id: str) -> str:
     payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "refresh"}
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def set_auth_cookies(response: Response, access: str, refresh: Optional[str] = None):
+    frontend_url = os.environ.get("FRONTEND_URL", "")
+    secure_cookie = os.environ.get("COOKIE_SECURE", "").lower() == "true" or frontend_url.startswith("https://")
+    same_site = "none" if secure_cookie else "lax"
+    response.set_cookie("access_token", access, httponly=True, secure=secure_cookie, samesite=same_site, max_age=3600, path="/")
+    if refresh:
+        response.set_cookie("refresh_token", refresh, httponly=True, secure=secure_cookie, samesite=same_site, max_age=604800, path="/")
+
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
@@ -817,8 +825,7 @@ async def login(req: LoginRequest, response: Response):
     user_id = user["id"]
     access = create_access_token(user_id, email)
     refresh = create_refresh_token(user_id)
-    response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=3600, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    set_auth_cookies(response, access, refresh)
     try:
         await create_audit_log(None, user_id, email, "login", "auth")
     except PyMongoError as exc:
@@ -835,8 +842,7 @@ async def register(req: RegisterRequest, response: Response):
     await db.users.insert_one(doc)
     access = create_access_token(user_id, email)
     refresh = create_refresh_token(user_id)
-    response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=3600, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    set_auth_cookies(response, access, refresh)
     return {"id": user_id, "email": email, "name": req.name, "role": "business_owner", "business_ids": [], "status": "active"}
 
 @auth_router.get("/me")
@@ -862,7 +868,7 @@ async def refresh_token(request: Request, response: Response):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         access = create_access_token(user["id"], user["email"])
-        response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=3600, path="/")
+        set_auth_cookies(response, access)
         return {"message": "Token refreshed"}
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh token expired")
