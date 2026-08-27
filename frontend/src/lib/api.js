@@ -22,6 +22,7 @@ export function formatApiError(err) {
     if (detail.feature) parts.push(`feature: ${detail.feature}`);
     if (detail.limit) parts.push(`limit: ${detail.limit}`);
     if (detail.currentPlan) parts.push(`plan: ${detail.currentPlan}`);
+    if (detail.message) parts.push(detail.message);
     if (detail.detail) parts.push(detail.detail);
     return parts.join(' - ');
   }
