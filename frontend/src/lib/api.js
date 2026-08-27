@@ -14,12 +14,44 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+function compact(value) {
+  return String(value ?? '').trim();
+}
+
+function formatDetailValue(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map(formatDetailValue).filter(Boolean).join(' ');
+  }
+  if (typeof value !== 'object') return String(value);
+
+  const parts = [];
+  if (value.code) parts.push(value.code);
+  if (value.status_code) parts.push(`HTTP ${value.status_code}`);
+  if (value.context) parts.push(value.context);
+  if (value.message) parts.push(formatDetailValue(value.message));
+  if (value.detail) parts.push(formatDetailValue(value.detail));
+  if (value.response) parts.push(formatDetailValue(value.response));
+  if (value.error) parts.push(formatDetailValue(value.error));
+  if (value.url && parts.length < 3) parts.push(value.url);
+
+  const formatted = parts.map(compact).filter(Boolean).join(' - ');
+  if (formatted) return formatted;
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 // Format API error detail for display
 export function formatApiError(err) {
   const detail = err?.response?.data?.detail;
   if (!detail) return err?.message || 'Something went wrong';
   if (typeof detail === 'string') return detail;
-  if (Array.isArray(detail)) return detail.map(e => e?.msg || JSON.stringify(e)).join(' ');
+  if (Array.isArray(detail)) return detail.map(e => e?.msg || formatDetailValue(e)).join(' ');
   if (detail?.msg) return detail.msg;
   if (detail?.code) {
     const parts = [detail.code];
@@ -27,15 +59,11 @@ export function formatApiError(err) {
     if (detail.feature) parts.push(`feature: ${detail.feature}`);
     if (detail.limit) parts.push(`limit: ${detail.limit}`);
     if (detail.currentPlan) parts.push(`plan: ${detail.currentPlan}`);
-    if (detail.message) parts.push(detail.message);
-    if (detail.detail) parts.push(detail.detail);
-    return parts.join(' - ');
+    if (detail.message) parts.push(formatDetailValue(detail.message));
+    if (detail.detail) parts.push(formatDetailValue(detail.detail));
+    return parts.map(compact).filter(Boolean).join(' - ');
   }
-  try {
-    return JSON.stringify(detail);
-  } catch {
-    return String(detail);
-  }
+  return formatDetailValue(detail);
 }
 
 export default api;
