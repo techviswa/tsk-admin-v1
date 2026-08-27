@@ -3181,7 +3181,13 @@ async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
     provisioned = await provision_admin_business_to_pos(business_id)
     if not provisioned:
         return {}
-    return {"business_id": provisioned["business_id"], "x-tenant-id": provisioned["tenant_id"]}
+    return {
+        "business_id": provisioned["business_id"],
+        "x-business-id": provisioned["business_id"],
+        "tenant_id": provisioned["tenant_id"],
+        "tenantId": provisioned["tenant_id"],
+        "x-tenant-id": provisioned["tenant_id"],
+    }
 
 def admin_role_to_pos_role(role: str) -> str:
     if role == "business_owner":
@@ -3309,7 +3315,18 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
         return None
     if not user_doc.get("email"):
         return None
-    pos_headers = await pos_headers_for_admin_business(business_ids[0])
+    business_id = business_ids[0]
+    pos_headers = await pos_headers_for_admin_business(business_id)
+    business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
+    outlet = await ensure_default_outlet_for_business(
+        business_id,
+        sync_to_pos=True,
+        pos_business_id=(business or {}).get("pos_external_id") or pos_headers.get("business_id"),
+        pos_tenant_id=(business or {}).get("pos_tenant_id") or pos_headers.get("x-tenant-id"),
+    )
+    pos_business_id = (business or {}).get("pos_external_id") or pos_headers.get("business_id") or business_id
+    pos_tenant_id = (business or {}).get("pos_tenant_id") or pos_headers.get("x-tenant-id") or f"admincore-{business_id}"
+    pos_outlet_id = (outlet or {}).get("pos_external_id") or (outlet or {}).get("id")
     staff_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "staff", extra_headers=pos_headers))
     existing = next((row for row in staff_rows if (row.get("email") or "").lower() == user_doc["email"].lower()), None)
     payload = {
@@ -3318,6 +3335,14 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
         "role": admin_role_to_pos_role(user_doc.get("role")),
         "active": user_doc.get("status", "active") == "active",
         "profile_required": False,
+        "business_id": pos_business_id,
+        "businessId": pos_business_id,
+        "tenant_id": pos_tenant_id,
+        "tenantId": pos_tenant_id,
+        "assigned_outlet_ids": [pos_outlet_id] if pos_outlet_id else [],
+        "assignedOutletIds": [pos_outlet_id] if pos_outlet_id else [],
+        "default_outlet_id": pos_outlet_id or "",
+        "defaultOutletId": pos_outlet_id or "",
     }
     if password:
         payload["password"] = password
@@ -3327,14 +3352,56 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
         payload["password"] = secrets.token_urlsafe(10)
 
     if existing:
+        existing_business_id = str(existing.get("business_id") or existing.get("businessId") or existing.get("pos_business_id") or "")
+        if not existing_business_id:
+            raise HTTPException(status_code=409, detail={
+                "code": "POS_USER_SCOPE_UNKNOWN",
+                "message": "POS returned an existing user without a business scope. AdminCore stopped to prevent cross-business access.",
+                "email": user_doc["email"],
+                "target_business_id": pos_business_id,
+            })
+        if existing_business_id and existing_business_id != str(pos_business_id):
+            raise HTTPException(status_code=409, detail={
+                "code": "POS_USER_EMAIL_CONFLICT",
+                "message": "POS already has this email assigned to a different business. Use a unique owner email or fix the existing POS staff record first.",
+                "email": user_doc["email"],
+                "existing_business_id": existing_business_id,
+                "target_business_id": pos_business_id,
+            })
         result = await pos_core_session_request("PUT", f"staff/{existing['id']}", json=payload, extra_headers=pos_headers)
         pos_user_id = existing["id"]
     else:
         result = await pos_core_session_request("POST", "staff", json=payload, extra_headers=pos_headers)
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_user_id = created.get("id") if isinstance(created, dict) else None
+        created_business_id = str((created or {}).get("business_id") or (created or {}).get("businessId") or "")
+        if not created_business_id:
+            raise HTTPException(status_code=502, detail={
+                "code": "POS_USER_SCOPE_MISSING",
+                "message": "POS created the owner user without returning a business scope. AdminCore stopped to prevent cross-business access.",
+                "email": user_doc["email"],
+                "target_business_id": pos_business_id,
+            })
+        if created_business_id and created_business_id != str(pos_business_id):
+            raise HTTPException(status_code=502, detail={
+                "code": "POS_USER_BUSINESS_MISMATCH",
+                "message": "POS created the owner user under a different business than AdminCore requested.",
+                "email": user_doc["email"],
+                "created_business_id": created_business_id,
+                "target_business_id": pos_business_id,
+            })
     if pos_user_id:
-        await db.users.update_one({"id": user_doc["id"]}, {"$set": {"pos_external_id": pos_user_id, "pos_synced": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
+        await db.users.update_one(
+            {"id": user_doc["id"]},
+            {"$set": {
+                "pos_external_id": pos_user_id,
+                "pos_business_id": pos_business_id,
+                "pos_tenant_id": pos_tenant_id,
+                "pos_assigned_outlet_ids": [pos_outlet_id] if pos_outlet_id else [],
+                "pos_synced": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
     return result
 
 async def push_admin_product_to_pos(product_doc: dict):
