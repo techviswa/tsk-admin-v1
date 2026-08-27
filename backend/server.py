@@ -3316,8 +3316,6 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
     pos_business_id = (business or {}).get("pos_external_id") or pos_headers.get("business_id") or business_id
     pos_tenant_id = (business or {}).get("pos_tenant_id") or pos_headers.get("x-tenant-id") or f"admincore-{business_id}"
     pos_outlet_id = (outlet or {}).get("pos_external_id") or (outlet or {}).get("id")
-    staff_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "staff", extra_headers=pos_headers))
-    existing = next((row for row in staff_rows if (row.get("email") or "").lower() == user_doc["email"].lower()), None)
     payload = {
         "name": user_doc.get("name") or user_doc["email"].split("@")[0],
         "email": user_doc["email"],
@@ -3335,50 +3333,23 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
     }
     if password:
         payload["password"] = password
-    elif not existing:
+    else:
         if not allow_generated_password:
             raise HTTPException(status_code=400, detail="Set a new password before syncing this user to POS")
         payload["password"] = secrets.token_urlsafe(10)
 
-    if existing:
-        existing_business_id = str(existing.get("business_id") or existing.get("businessId") or existing.get("pos_business_id") or "")
-        if not existing_business_id:
-            raise HTTPException(status_code=409, detail={
-                "code": "POS_USER_SCOPE_UNKNOWN",
-                "message": "POS returned an existing user without a business scope. AdminCore stopped to prevent cross-business access.",
-                "email": user_doc["email"],
-                "target_business_id": pos_business_id,
-            })
-        if existing_business_id and existing_business_id != str(pos_business_id):
-            raise HTTPException(status_code=409, detail={
-                "code": "POS_USER_EMAIL_CONFLICT",
-                "message": "POS already has this email assigned to a different business. Use a unique owner email or fix the existing POS staff record first.",
-                "email": user_doc["email"],
-                "existing_business_id": existing_business_id,
-                "target_business_id": pos_business_id,
-            })
-        result = await pos_core_session_request("PUT", f"staff/{existing['id']}", json=payload, extra_headers=pos_headers)
-        pos_user_id = existing["id"]
-    else:
-        result = await pos_core_session_request("POST", "staff", json=payload, extra_headers=pos_headers)
-        created = result.get("data") if isinstance(result, dict) and "data" in result else result
-        pos_user_id = created.get("id") if isinstance(created, dict) else None
-        created_business_id = str((created or {}).get("business_id") or (created or {}).get("businessId") or "")
-        if not created_business_id:
-            raise HTTPException(status_code=502, detail={
-                "code": "POS_USER_SCOPE_MISSING",
-                "message": "POS created the owner user without returning a business scope. AdminCore stopped to prevent cross-business access.",
-                "email": user_doc["email"],
-                "target_business_id": pos_business_id,
-            })
-        if created_business_id and created_business_id != str(pos_business_id):
-            raise HTTPException(status_code=502, detail={
-                "code": "POS_USER_BUSINESS_MISMATCH",
-                "message": "POS created the owner user under a different business than AdminCore requested.",
-                "email": user_doc["email"],
-                "created_business_id": created_business_id,
-                "target_business_id": pos_business_id,
-            })
+    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers)
+    created = result.get("data") if isinstance(result, dict) and "data" in result else result
+    pos_user_id = created.get("id") if isinstance(created, dict) else None
+    created_business_id = str((created or {}).get("business_id") or (created or {}).get("businessId") or "")
+    if created_business_id and created_business_id != str(pos_business_id):
+        raise HTTPException(status_code=502, detail={
+            "code": "POS_USER_BUSINESS_MISMATCH",
+            "message": "POS linked the owner user under a different business than AdminCore requested.",
+            "email": user_doc["email"],
+            "created_business_id": created_business_id,
+            "target_business_id": pos_business_id,
+        })
     if pos_user_id:
         await db.users.update_one(
             {"id": user_doc["id"]},
