@@ -21,6 +21,7 @@ export default function BusinessesPage() {
   const { selectBusiness, refreshBusinesses } = useBusiness();
   const [businesses, setBusinesses] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [retryingId, setRetryingId] = useState('');
@@ -61,6 +62,8 @@ export default function BusinessesPage() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
     try {
       if (editing) {
         await api.put(`/businesses/${editing.id}`, { name: form.name, type: form.type, plan: form.plan });
@@ -76,6 +79,8 @@ export default function BusinessesPage() {
       toast.error(formatApiError(err));
       fetchBusinesses();
       refreshBusinesses();
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -257,8 +262,8 @@ export default function BusinessesPage() {
                 </div>
               </div>
             )}
-            <Button type="submit" className="w-full bg-blue-600 hover:bg-blue-700" data-testid="business-submit-btn">
-              {editing ? 'Update Business' : 'Create & Provision Business'}
+            <Button type="submit" className="w-full bg-blue-600 hover:bg-blue-700" disabled={submitting} data-testid="business-submit-btn">
+              {submitting ? (editing ? 'Updating...' : 'Provisioning...') : (editing ? 'Update Business' : 'Create & Provision Business')}
             </Button>
           </form>
         </SheetContent>

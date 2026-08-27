@@ -118,6 +118,24 @@ def pos_error_detail(exc: Exception):
         return exc.detail
     return str(exc)
 
+def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
+    response = getattr(exc, "response", None)
+    detail = {
+        "code": "POS_CORE_REQUEST_FAILED",
+        "message": str(exc),
+        "context": context,
+    }
+    if response is not None:
+        detail.update({
+            "status_code": response.status_code,
+            "url": response.url,
+        })
+        try:
+            detail["response"] = response.json()
+        except ValueError:
+            detail["response"] = (response.text or "")[:1000]
+    return detail
+
 async def mark_business_pos_status(business_id: str, status: str, error=None, extra: Optional[dict] = None):
     update = {
         "pos_provisioning_status": status,
@@ -131,6 +149,46 @@ async def mark_business_pos_status(business_id: str, status: str, error=None, ex
     if extra:
         update.update(extra)
     await db.businesses.update_one({"id": business_id}, {"$set": update})
+
+async def rollback_failed_business_create(business_id: str, actor_id: str, owner_email: str = ""):
+    cleanup_collections = [
+        db.businesses,
+        db.business_modules,
+        db.settings,
+        db.outlets,
+        db.products,
+        db.qr_codes,
+        db.subscriptions,
+        db.business_addons,
+        db.feature_flags,
+        db.integrations,
+        db.pos_sales_orders,
+        db.pos_bills,
+        db.pos_payments,
+        db.pos_tables,
+        db.pos_reservations,
+        db.pos_customers,
+        db.pos_kitchen_kot,
+        db.pos_inventory_admin,
+        db.pos_inventory_movements,
+        db.pos_staff_shifts,
+        db.pos_reports_analytics,
+    ]
+    for collection in cleanup_collections:
+        await collection.delete_many({"business_id": business_id})
+    await db.businesses.delete_one({"id": business_id})
+    await db.audit_logs.delete_many({"business_id": business_id})
+    await db.users.update_one({"id": actor_id}, {"$pull": {"business_ids": business_id}})
+    if owner_email:
+        owner = await db.users.find_one({"email": owner_email}, {"_id": 0, "id": 1, "business_ids": 1, "role": 1})
+        if owner:
+            remaining = [bid for bid in owner.get("business_ids", []) if bid != business_id]
+            if remaining:
+                await db.users.update_one({"id": owner["id"]}, {"$set": {"business_ids": remaining, "updated_at": datetime.now(timezone.utc).isoformat()}})
+            elif owner.get("role") == "business_owner":
+                await db.users.delete_one({"id": owner["id"]})
+            else:
+                await db.users.update_one({"id": owner["id"]}, {"$set": {"business_ids": [], "updated_at": datetime.now(timezone.utc).isoformat()}})
 
 async def ensure_business_owner_user(
     business_id: str,
@@ -1185,7 +1243,13 @@ async def create_business(data: BusinessCreate, request: Request):
         )
     except HTTPException as exc:
         logger.warning("Could not provision AdminCore business to POS: %s", exc.detail)
-        raise HTTPException(status_code=502, detail={"code": "POS_PROVISIONING_FAILED", "business_id": biz_id, "message": exc.detail})
+        await rollback_failed_business_create(biz_id, user["id"], owner_email)
+        raise HTTPException(status_code=502, detail={
+            "code": "POS_PROVISIONING_FAILED",
+            "message": exc.detail,
+            "rolled_back": True,
+            "detail": "AdminCore did not keep this business because POS provisioning failed. Fix the POS error and create it again.",
+        })
     created_outlet = await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=not POS_CORE_API_BASE_URL)
     created_qr_code = None
     if qr_setup_mode == "local":
@@ -3033,13 +3097,14 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
     try:
         return await run_in_threadpool(do_request)
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail={
+        detail = requests_error_detail(exc, f"POS bridge request for {resource}")
+        detail.update({
             "code": "POS_BRIDGE_REQUEST_FAILED",
             "resource": resource,
             "endpoint": config.get("endpoint"),
             "tried": endpoint_candidates,
-            "message": str(exc),
-        }) from exc
+        })
+        raise HTTPException(status_code=502, detail=detail) from exc
 
 async def pos_core_session_request(method: str, endpoint: str, json: dict | None = None, params: dict | None = None, extra_headers: Optional[dict] = None):
     ensure_pos_bridge_config()
@@ -3074,7 +3139,7 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
     try:
         return await run_in_threadpool(do_request)
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"POS core request failed for {endpoint}: {exc}") from exc
+        raise HTTPException(status_code=502, detail=requests_error_detail(exc, f"POS core request for {endpoint}")) from exc
 
 async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
     if not business_id:
