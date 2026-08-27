@@ -9,6 +9,8 @@ import logging
 import secrets
 import requests
 import base64
+import re
+import time
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
@@ -118,6 +120,19 @@ def pos_error_detail(exc: Exception):
         return exc.detail
     return str(exc)
 
+def summarize_response_text(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if "<html" in raw.lower() or "<!doctype" in raw.lower():
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.IGNORECASE | re.DOTALL)
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "HTML error page"
+        body = re.sub(r"<style.*?</style>|<script.*?</script>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        return f"{title}: {body[:240]}"
+    return raw[:500]
+
 def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
     response = getattr(exc, "response", None)
     detail = {
@@ -133,8 +148,31 @@ def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
         try:
             detail["response"] = response.json()
         except ValueError:
-            detail["response"] = (response.text or "")[:1000]
+            detail["response"] = summarize_response_text(response.text)
     return detail
+
+def pos_core_login(session: requests.Session, headers: dict):
+    if not POS_CORE_OWNER_EMAIL or not POS_CORE_OWNER_PASSWORD:
+        return
+    login_url = f"{POS_CORE_API_BASE_URL}/api/auth/login"
+    last_exc = None
+    for attempt in range(3):
+        try:
+            response = session.post(
+                login_url,
+                json={"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD},
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return
+        except requests.RequestException as exc:
+            last_exc = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status not in [502, 503, 504] or attempt == 2:
+                break
+            time.sleep(2 * (attempt + 1))
+    raise last_exc
 
 async def mark_business_pos_status(business_id: str, status: str, error=None, extra: Optional[dict] = None):
     update = {
@@ -3054,14 +3092,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
 
     def do_request():
         session = requests.Session()
-        if POS_CORE_OWNER_EMAIL and POS_CORE_OWNER_PASSWORD:
-            login_response = session.post(
-                f"{POS_CORE_API_BASE_URL}/api/auth/login",
-                json={"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD},
-                headers=headers,
-                timeout=30,
-            )
-            login_response.raise_for_status()
+        pos_core_login(session, headers)
         last_response = None
         for index, endpoint in enumerate(endpoint_candidates):
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
@@ -3117,14 +3148,7 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
 
     def do_request():
         session = requests.Session()
-        if POS_CORE_OWNER_EMAIL and POS_CORE_OWNER_PASSWORD:
-            login_response = session.post(
-                f"{POS_CORE_API_BASE_URL}/api/auth/login",
-                json={"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD},
-                headers=headers,
-                timeout=30,
-            )
-            login_response.raise_for_status()
+        pos_core_login(session, headers)
         response = session.request(
             method,
             f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}",

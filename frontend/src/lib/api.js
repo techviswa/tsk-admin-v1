@@ -18,6 +18,11 @@ function compact(value) {
   return String(value ?? '').trim();
 }
 
+function shorten(value, max = 500) {
+  const text = compact(value);
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
 function formatDetailValue(value) {
   if (!value) return '';
   if (typeof value === 'string') return value;
@@ -37,7 +42,7 @@ function formatDetailValue(value) {
   if (value.url && parts.length < 3) parts.push(value.url);
 
   const formatted = parts.map(compact).filter(Boolean).join(' - ');
-  if (formatted) return formatted;
+  if (formatted) return shorten(formatted);
 
   try {
     return JSON.stringify(value);
@@ -61,9 +66,9 @@ export function formatApiError(err) {
     if (detail.currentPlan) parts.push(`plan: ${detail.currentPlan}`);
     if (detail.message) parts.push(formatDetailValue(detail.message));
     if (detail.detail) parts.push(formatDetailValue(detail.detail));
-    return parts.map(compact).filter(Boolean).join(' - ');
+    return shorten(parts.map(compact).filter(Boolean).join(' - '));
   }
-  return formatDetailValue(detail);
+  return shorten(formatDetailValue(detail));
 }
 
 export default api;
