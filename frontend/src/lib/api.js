@@ -23,9 +23,25 @@ function shorten(value, max = 500) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+function stripHtmlError(value) {
+  const text = compact(value);
+  if (!/<\/?[a-z][\s\S]*>/i.test(text) && !text.toLowerCase().includes('<!doctype')) {
+    return text;
+  }
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : 'HTML error page';
+  const body = text
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return `${title}${body ? `: ${body}` : ''}`;
+}
+
 function formatDetailValue(value) {
   if (!value) return '';
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return shorten(stripHtmlError(value));
   if (Array.isArray(value)) {
     return value.map(formatDetailValue).filter(Boolean).join(' ');
   }
