@@ -15,7 +15,7 @@ from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Query, BackgroundTasks
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.cors import CORSMiddleware
@@ -312,6 +312,24 @@ async def provision_business_end_to_end(
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=502, detail=f"POS provisioning failed: {detail}") from exc
+
+async def provision_business_end_to_end_background(
+    business_id: str,
+    owner_name: Optional[str] = None,
+    owner_email: Optional[str] = None,
+    owner_password: Optional[str] = None,
+    actor: Optional[dict] = None,
+):
+    try:
+        await provision_business_end_to_end(
+            business_id,
+            owner_name=owner_name,
+            owner_email=owner_email,
+            owner_password=owner_password,
+            actor=actor,
+        )
+    except Exception as exc:
+        logger.warning("Background POS provisioning failed for business %s: %s", business_id, pos_error_detail(exc))
 
 
 # ===================================================================
@@ -1224,7 +1242,7 @@ async def list_businesses(request: Request):
     return businesses
 
 @business_router.post("")
-async def create_business(data: BusinessCreate, request: Request):
+async def create_business(data: BusinessCreate, request: Request, background_tasks: BackgroundTasks):
     user = await get_current_user(request)
     if user["role"] not in ["platform_admin", "business_owner"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -1270,24 +1288,16 @@ async def create_business(data: BusinessCreate, request: Request):
     await db.users.update_one({"id": user["id"]}, {"$addToSet": {"business_ids": biz_id}})
     await seed_business_defaults(biz_id)
     await create_audit_log(biz_id, user["id"], user["email"], "created", "business", biz_id, {"name": data.name})
-    pos_provisioned = None
-    try:
-        pos_provisioned = await provision_business_end_to_end(
+    pos_provisioned = False
+    if POS_CORE_API_BASE_URL:
+        background_tasks.add_task(
+            provision_business_end_to_end_background,
             biz_id,
-            owner_name=owner_name or data.name,
-            owner_email=owner_email,
-            owner_password=owner_password,
-            actor=user,
+            owner_name or data.name,
+            owner_email,
+            owner_password,
+            user,
         )
-    except HTTPException as exc:
-        logger.warning("Could not provision AdminCore business to POS: %s", exc.detail)
-        await rollback_failed_business_create(biz_id, user["id"], owner_email)
-        raise HTTPException(status_code=502, detail={
-            "code": "POS_PROVISIONING_FAILED",
-            "message": exc.detail,
-            "rolled_back": True,
-            "detail": "AdminCore did not keep this business because POS provisioning failed. Fix the POS error and create it again.",
-        })
     created_outlet = await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=not POS_CORE_API_BASE_URL)
     created_qr_code = None
     if qr_setup_mode == "local":
