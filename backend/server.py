@@ -15,7 +15,7 @@ from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Query, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Query
 from fastapi.responses import RedirectResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.cors import CORSMiddleware
@@ -312,24 +312,6 @@ async def provision_business_end_to_end(
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=502, detail=f"POS provisioning failed: {detail}") from exc
-
-async def provision_business_end_to_end_background(
-    business_id: str,
-    owner_name: Optional[str] = None,
-    owner_email: Optional[str] = None,
-    owner_password: Optional[str] = None,
-    actor: Optional[dict] = None,
-):
-    try:
-        await provision_business_end_to_end(
-            business_id,
-            owner_name=owner_name,
-            owner_email=owner_email,
-            owner_password=owner_password,
-            actor=actor,
-        )
-    except Exception as exc:
-        logger.warning("Background POS provisioning failed for business %s: %s", business_id, pos_error_detail(exc))
 
 # ===================================================================
 # AUDIT HELPER
@@ -1241,7 +1223,7 @@ async def list_businesses(request: Request):
     return businesses
 
 @business_router.post("")
-async def create_business(data: BusinessCreate, request: Request, background_tasks: BackgroundTasks):
+async def create_business(data: BusinessCreate, request: Request):
     user = await get_current_user(request)
     if user["role"] not in ["platform_admin", "business_owner"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -1287,16 +1269,28 @@ async def create_business(data: BusinessCreate, request: Request, background_tas
     await db.users.update_one({"id": user["id"]}, {"$addToSet": {"business_ids": biz_id}})
     await seed_business_defaults(biz_id)
     await create_audit_log(biz_id, user["id"], user["email"], "created", "business", biz_id, {"name": data.name})
-    pos_provisioned = False
-    if POS_CORE_API_BASE_URL:
-        background_tasks.add_task(
-            provision_business_end_to_end_background,
+    pos_provisioned = None
+    try:
+        pos_provisioned = await provision_business_end_to_end(
             biz_id,
-            owner_name or data.name,
-            owner_email,
-            owner_password,
-            user,
+            owner_name=owner_name or data.name,
+            owner_email=owner_email,
+            owner_password=owner_password,
+            actor=user,
         )
+    except HTTPException as exc:
+        detail = exc.detail
+        logger.warning("POS provisioning failed for new business %s: %s", biz_id, detail)
+        await rollback_failed_business_create(biz_id, user["id"], owner_email)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "POS_PROVISIONING_FAILED",
+                "message": detail,
+                "rolled_back": True,
+                "detail": "AdminCore did not keep this business because POS provisioning failed. Fix the POS error and create it again.",
+            },
+        ) from exc
     created_outlet = await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=not POS_CORE_API_BASE_URL)
     created_qr_code = None
     if qr_setup_mode == "local":
@@ -1412,7 +1406,9 @@ async def list_outlets(business_id: str, request: Request):
     user = await get_current_user(request)
     await validate_business_access(user, business_id)
     await require_business_module_enabled(business_id, CORE_FEATURE_MODULES["outlets"])
-    return await db.outlets.find({"business_id": business_id}, {"_id": 0}).to_list(100)
+    if await is_pos_connected_business(business_id):
+        await cleanup_mismatched_pos_imports("outlets", business_id)
+    return await db.outlets.find({"business_id": business_id, "tenant_scope_status": {"$ne": "quarantined"}}, {"_id": 0}).to_list(100)
 
 @outlet_router.post("/business/{business_id}")
 async def create_outlet(business_id: str, data: OutletCreate, request: Request):
@@ -1525,12 +1521,16 @@ async def list_products(
         query["outlet_id"] = outlet_id
     if q:
         query["name"] = {"$regex": q, "$options": "i"}
+    query["tenant_scope_status"] = {"$ne": "quarantined"}
+    if business_id and await is_pos_connected_business(business_id):
+        await cleanup_mismatched_pos_imports("products", business_id)
     products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
     if business_id and not products and not q and await is_pos_connected_business(business_id):
         now_ts = datetime.now(timezone.utc).isoformat()
         try:
             payload = await pos_bridge_request("products", {}, business_id=business_id)
             rows = normalize_pos_bridge_rows(payload)
+            rows = await validate_pos_rows_for_business("products", rows, business_id)
             for row in rows:
                 await sync_bridge_product(row, business_id, now_ts)
             products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
@@ -2240,19 +2240,23 @@ async def get_dashboard_stats(request: Request, business_id: Optional[str] = Que
     user = await get_current_user(request)
     if business_id:
         await validate_business_access(user, business_id)
-        total_outlets = await db.outlets.count_documents({"business_id": business_id, "status": "active"})
+        if await is_pos_connected_business(business_id):
+            for bridge_resource in ["outlets", "products", "orders", "bills", "payments", "tables", "reservations", "customers", "kitchen-tickets", "inventory", "staff-shifts", "reports"]:
+                await cleanup_mismatched_pos_imports(bridge_resource, business_id)
+        safe_business_query = {"business_id": business_id, "tenant_scope_status": {"$ne": "quarantined"}}
+        total_outlets = await db.outlets.count_documents({**safe_business_query, "status": "active"})
         total_users = await db.users.count_documents({"business_ids": business_id})
         total_modules = await db.business_modules.count_documents({"business_id": business_id, "enabled": True})
         total_flags = await db.feature_flags.count_documents({"business_id": business_id})
-        total_products = await db.products.count_documents({"business_id": business_id})
-        total_orders = await db.pos_sales_orders.count_documents({"business_id": business_id})
-        total_bills = await db.pos_bills.count_documents({"business_id": business_id})
-        total_inventory_items = await db.pos_inventory_admin.count_documents({"business_id": business_id})
-        total_staff_records = await db.pos_staff_shifts.count_documents({"business_id": business_id})
-        total_tables = await db.pos_tables.count_documents({"business_id": business_id})
-        total_kitchen_tickets = await db.pos_kitchen_kot.count_documents({"business_id": business_id})
+        total_products = await db.products.count_documents(safe_business_query)
+        total_orders = await db.pos_sales_orders.count_documents(safe_business_query)
+        total_bills = await db.pos_bills.count_documents(safe_business_query)
+        total_inventory_items = await db.pos_inventory_admin.count_documents(safe_business_query)
+        total_staff_records = await db.pos_staff_shifts.count_documents(safe_business_query)
+        total_tables = await db.pos_tables.count_documents(safe_business_query)
+        total_kitchen_tickets = await db.pos_kitchen_kot.count_documents(safe_business_query)
         revenue_rows = await db.pos_bills.aggregate([
-            {"$match": {"business_id": business_id}},
+            {"$match": safe_business_query},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
         ]).to_list(1)
         total_revenue = revenue_rows[0]["total"] if revenue_rows else 0
@@ -2261,8 +2265,8 @@ async def get_dashboard_stats(request: Request, business_id: Optional[str] = Que
         total_integrations = await db.integrations.count_documents({"business_id": business_id})
     elif user["role"] != "platform_admin":
         allowed_business_ids = user.get("business_ids", [])
-        scoped_query = {"business_id": {"$in": allowed_business_ids}}
-        total_outlets = await db.outlets.count_documents({"business_id": {"$in": allowed_business_ids}, "status": "active"})
+        scoped_query = {"business_id": {"$in": allowed_business_ids}, "tenant_scope_status": {"$ne": "quarantined"}}
+        total_outlets = await db.outlets.count_documents({**scoped_query, "status": "active"})
         total_users = await db.users.count_documents({"business_ids": {"$in": allowed_business_ids}})
         total_modules = await db.business_modules.count_documents({"business_id": {"$in": allowed_business_ids}, "enabled": True})
         total_flags = await db.feature_flags.count_documents(scoped_query)
@@ -2282,18 +2286,20 @@ async def get_dashboard_stats(request: Request, business_id: Optional[str] = Que
         total_businesses = await db.businesses.count_documents({"id": {"$in": allowed_business_ids}, "status": "active"})
         total_integrations = await db.integrations.count_documents(scoped_query)
     else:
-        total_outlets = await db.outlets.count_documents({"status": "active"})
+        safe_all_query = {"tenant_scope_status": {"$ne": "quarantined"}}
+        total_outlets = await db.outlets.count_documents({**safe_all_query, "status": "active"})
         total_users = await db.users.count_documents({})
         total_modules = await db.modules.count_documents({})
         total_flags = await db.feature_flags.count_documents({})
-        total_products = await db.products.count_documents({})
-        total_orders = await db.pos_sales_orders.count_documents({})
-        total_bills = await db.pos_bills.count_documents({})
-        total_inventory_items = await db.pos_inventory_admin.count_documents({})
-        total_staff_records = await db.pos_staff_shifts.count_documents({})
-        total_tables = await db.pos_tables.count_documents({})
-        total_kitchen_tickets = await db.pos_kitchen_kot.count_documents({})
+        total_products = await db.products.count_documents(safe_all_query)
+        total_orders = await db.pos_sales_orders.count_documents(safe_all_query)
+        total_bills = await db.pos_bills.count_documents(safe_all_query)
+        total_inventory_items = await db.pos_inventory_admin.count_documents(safe_all_query)
+        total_staff_records = await db.pos_staff_shifts.count_documents(safe_all_query)
+        total_tables = await db.pos_tables.count_documents(safe_all_query)
+        total_kitchen_tickets = await db.pos_kitchen_kot.count_documents(safe_all_query)
         revenue_rows = await db.pos_bills.aggregate([
+            {"$match": safe_all_query},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
         ]).to_list(1)
         total_revenue = revenue_rows[0]["total"] if revenue_rows else 0
@@ -2571,7 +2577,7 @@ def pos_resource_config(resource: str) -> dict:
     return config
 
 async def pos_business_filter(user: dict, business_id: Optional[str]) -> dict:
-    query = {}
+    query = {"tenant_scope_status": {"$ne": "quarantined"}}
     if user["role"] == "platform_admin":
         if business_id:
             await validate_business_access(user, business_id)
@@ -2629,6 +2635,17 @@ async def list_pos_admin_records(
     user = await get_current_user(request)
     await require_module_for_business_scope(user, business_id, POS_RESOURCE_MODULES.get(resource))
     query = await pos_business_filter(user, business_id)
+    if business_id and await is_pos_connected_business(business_id):
+        bridge_resource = next(
+            (
+                key
+                for key, value in POS_BRIDGE_RESOURCES.items()
+                if value.get("pos_resource") == resource or key == resource
+            ),
+            None,
+        )
+        if bridge_resource:
+            await cleanup_mismatched_pos_imports(bridge_resource, business_id)
     if outlet_id:
         query["outlet_id"] = outlet_id
     if status and status != "all":
@@ -2672,6 +2689,8 @@ async def list_pos_admin_records(
 async def get_pos_payment_report(request: Request, business_id: Optional[str] = Query(None)):
     user = await get_current_user(request)
     await require_module_for_business_scope(user, business_id, POS_RESOURCE_MODULES["payments"])
+    if business_id and await is_pos_connected_business(business_id):
+        await cleanup_mismatched_pos_imports("payments", business_id)
     query = await pos_business_filter(user, business_id)
     rows = await db.pos_payments.find(query, {"_id": 0}).to_list(1000)
     by_method = {}
@@ -2730,6 +2749,8 @@ async def get_customer_order_history(record_id: str, request: Request):
 async def get_kitchen_performance(request: Request, business_id: Optional[str] = Query(None)):
     user = await get_current_user(request)
     await require_module_for_business_scope(user, business_id, POS_RESOURCE_MODULES["kitchen-kot"])
+    if business_id and await is_pos_connected_business(business_id):
+        await cleanup_mismatched_pos_imports("kitchen-tickets", business_id)
     query = await pos_business_filter(user, business_id)
     tickets = await db.pos_kitchen_kot.find(query, {"_id": 0}).to_list(1000)
     status_counts = {}
@@ -2753,14 +2774,17 @@ async def get_kitchen_performance(request: Request, business_id: Optional[str] =
 async def get_reports_summary(request: Request, business_id: Optional[str] = Query(None)):
     user = await get_current_user(request)
     await require_module_for_business_scope(user, business_id, POS_RESOURCE_MODULES["reports-analytics"])
+    if business_id and await is_pos_connected_business(business_id):
+        for bridge_resource in ["orders", "bills", "payments", "inventory", "staff-shifts", "tables", "kitchen-tickets", "products", "outlets"]:
+            await cleanup_mismatched_pos_imports(bridge_resource, business_id)
     query = await pos_business_filter(user, business_id)
     sales = await db.pos_sales_orders.find(query, {"_id": 0}).to_list(1000)
     payments = await db.pos_payments.find(query, {"_id": 0}).to_list(1000)
     inventory = await db.pos_inventory_admin.find(query, {"_id": 0}).to_list(1000)
     staff = await db.pos_staff_shifts.find(query, {"_id": 0}).to_list(1000)
     taxes = await db.pos_taxes_charges.find(query, {"_id": 0}).to_list(1000)
-    products = await db.products.find(query, {"_id": 0}).to_list(1000) if query.get("business_id") else await db.products.find({}, {"_id": 0}).to_list(1000)
-    outlets = await db.outlets.find(query, {"_id": 0}).to_list(1000) if query.get("business_id") else await db.outlets.find({}, {"_id": 0}).to_list(1000)
+    products = await db.products.find(query, {"_id": 0}).to_list(1000)
+    outlets = await db.outlets.find(query, {"_id": 0}).to_list(1000)
     return {
         "sales": {"count": len(sales), "total": round(sum(float(row.get("amount") or 0) for row in sales), 2)},
         "products": {"count": len(products), "active": len([row for row in products if row.get("active") is not False])},
@@ -3104,6 +3128,146 @@ def normalize_pos_bridge_rows(payload):
         return [data]
     return data if isinstance(data, list) else []
 
+def pos_row_business_id(row: dict) -> str:
+    business = row.get("business")
+    if isinstance(business, dict):
+        business = business.get("id") or business.get("business_id") or business.get("businessId")
+    return str(row.get("business_id") or row.get("businessId") or row.get("pos_business_id") or business or "").strip()
+
+def pos_row_tenant_id(row: dict) -> str:
+    tenant = row.get("tenant")
+    if isinstance(tenant, dict):
+        tenant = tenant.get("id") or tenant.get("tenant_id") or tenant.get("tenantId")
+    return str(row.get("tenant_id") or row.get("tenantId") or row.get("pos_tenant_id") or tenant or "").strip()
+
+async def expected_pos_scope_for_business(business_id: str) -> dict:
+    business = await db.businesses.find_one(
+        {"id": business_id},
+        {"_id": 0, "id": 1, "name": 1, "pos_external_id": 1, "pos_tenant_id": 1},
+    )
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+    expected_business_id = str(business.get("pos_external_id") or business_id).strip()
+    expected_tenant_id = str(business.get("pos_tenant_id") or f"admincore-{business_id}").strip()
+    return {
+        "local_business_id": business_id,
+        "business_name": business.get("name", ""),
+        "business_id": expected_business_id,
+        "tenant_id": expected_tenant_id,
+    }
+
+def validate_pos_row_scope(resource: str, row: dict, scope: dict):
+    actual_business_id = pos_row_business_id(row)
+    actual_tenant_id = pos_row_tenant_id(row)
+    if not actual_business_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "POS_TENANT_SCOPE_MISSING",
+                "resource": resource,
+                "expected_business_id": scope["business_id"],
+                "expected_tenant_id": scope["tenant_id"],
+                "message": "POS returned data without business_id, so AdminCore refused to import it.",
+            },
+        )
+    if actual_business_id != scope["business_id"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "POS_TENANT_SCOPE_MISMATCH",
+                "resource": resource,
+                "expected_business_id": scope["business_id"],
+                "actual_business_id": actual_business_id,
+                "expected_tenant_id": scope["tenant_id"],
+                "actual_tenant_id": actual_tenant_id,
+                "message": "POS returned data for a different business, so AdminCore refused to import it.",
+            },
+        )
+    if actual_tenant_id and scope["tenant_id"] and actual_tenant_id != scope["tenant_id"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "POS_TENANT_SCOPE_MISMATCH",
+                "resource": resource,
+                "expected_business_id": scope["business_id"],
+                "actual_business_id": actual_business_id,
+                "expected_tenant_id": scope["tenant_id"],
+                "actual_tenant_id": actual_tenant_id,
+                "message": "POS returned data for a different tenant, so AdminCore refused to import it.",
+            },
+        )
+
+async def validate_pos_rows_for_business(resource: str, rows: list, business_id: Optional[str]) -> list:
+    if not business_id or resource == "businesses":
+        return rows
+    scope = await expected_pos_scope_for_business(business_id)
+    for row in rows:
+        if isinstance(row, dict):
+            validate_pos_row_scope(resource, row, scope)
+    return rows
+
+async def assert_pos_row_scope(resource: str, row: dict, business_id: Optional[str]):
+    if not business_id or resource == "businesses":
+        return
+    scope = await expected_pos_scope_for_business(business_id)
+    validate_pos_row_scope(resource, row, scope)
+
+async def cleanup_mismatched_pos_imports(resource: str, business_id: Optional[str]):
+    if not business_id or resource == "businesses":
+        return
+    config = pos_bridge_resource(resource)
+    collection = db[config["collection"]]
+    scope = await expected_pos_scope_for_business(business_id)
+    quarantine_filter = {
+        "business_id": business_id,
+        "$or": [
+            {"source": {"$in": ["pos", "pos-bridge"]}, "pos_business_id": {"$exists": False}},
+            {"source": {"$in": ["pos", "pos-bridge"]}, "pos_business_id": ""},
+            {"source": {"$in": ["pos", "pos-bridge"]}, "pos_business_id": {"$ne": scope["business_id"]}},
+            {"pos_synced": True, "pos_business_id": {"$exists": False}},
+            {"pos_synced": True, "pos_business_id": ""},
+            {"pos_synced": True, "pos_business_id": {"$ne": scope["business_id"]}},
+        ],
+    }
+    await collection.update_many(
+        quarantine_filter,
+        {
+            "$set": {
+                "tenant_scope_status": "quarantined",
+                "tenant_scope_error": {
+                    "code": "POS_TENANT_SCOPE_UNVERIFIED",
+                    "expected_business_id": scope["business_id"],
+                    "expected_tenant_id": scope["tenant_id"],
+                },
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    if resource in ["staff", "staff-shifts"]:
+        await db.users.update_many(
+            {
+                "business_ids": business_id,
+                "pos_synced": True,
+                "$or": [
+                    {"pos_business_id": {"$exists": False}},
+                    {"pos_business_id": ""},
+                    {"pos_business_id": {"$ne": scope["business_id"]}},
+                ],
+            },
+            {
+                "$pull": {"business_ids": business_id},
+                "$set": {
+                    "tenant_scope_status": "quarantined",
+                    "tenant_scope_error": {
+                        "code": "POS_TENANT_SCOPE_UNVERIFIED",
+                        "expected_business_id": scope["business_id"],
+                        "expected_tenant_id": scope["tenant_id"],
+                    },
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            },
+        )
+
 async def pos_bridge_request(resource: str, params: dict | None = None, business_id: Optional[str] = None):
     ensure_pos_bridge_config()
     config = pos_bridge_resource(resource)
@@ -3114,6 +3278,12 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         headers["x-api-key"] = POS_CORE_API_KEY
     if business_id:
         headers.update(await pos_headers_for_admin_business(business_id))
+    request_params = dict(params or {})
+    if business_id and resource != "businesses":
+        request_params.setdefault("business_id", headers.get("business_id") or headers.get("x-business-id"))
+        request_params.setdefault("businessId", headers.get("business_id") or headers.get("x-business-id"))
+        request_params.setdefault("tenant_id", headers.get("tenant_id") or headers.get("x-tenant-id"))
+        request_params.setdefault("tenantId", headers.get("tenantId") or headers.get("x-tenant-id"))
 
     def do_request():
         session = requests.Session()
@@ -3121,12 +3291,12 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         last_response = None
         for index, endpoint in enumerate(endpoint_candidates):
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
-            response = session.get(url, params=params or {}, headers=headers, timeout=45)
+            response = session.get(url, params=request_params, headers=headers, timeout=45)
             last_response = response
             if response.status_code == 404 and index < len(endpoint_candidates) - 1:
                 continue
             if resource == "businesses" and response.status_code == 404:
-                products_response = session.get(f"{POS_CORE_API_BASE_URL}/api/products", params=params or {}, headers=headers, timeout=45)
+                products_response = session.get(f"{POS_CORE_API_BASE_URL}/api/products", params=request_params, headers=headers, timeout=45)
                 products_response.raise_for_status()
                 product_rows = normalize_pos_bridge_rows(products_response.json())
                 businesses = {}
@@ -3151,7 +3321,9 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         return []
 
     try:
-        return await run_in_threadpool(do_request)
+        payload = await run_in_threadpool(do_request)
+        await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), business_id)
+        return payload
     except requests.RequestException as exc:
         detail = requests_error_detail(exc, f"POS bridge request for {resource}")
         detail.update({
@@ -3615,6 +3787,7 @@ async def local_business_id_for_pos_row(row: dict, user: dict, now_ts: str) -> O
     )
 
 async def sync_bridge_outlet(row: dict, business_id: str, now_ts: str) -> str:
+    await assert_pos_row_scope("outlets", row, business_id)
     external_id = external_id_for(row)
     outlet_name = title_for(row, "POS Outlet")
     outlet_code = row.get("code")
@@ -3641,6 +3814,7 @@ async def sync_bridge_outlet(row: dict, business_id: str, now_ts: str) -> str:
         "pos_tenant_id": row.get("tenantId") or row.get("tenant_id") or "",
         "pos_external_id": external_id,
         "pos_synced": True,
+        "tenant_scope_status": "verified",
         "updated_at": now_ts,
     }
     if existing:
@@ -3651,6 +3825,7 @@ async def sync_bridge_outlet(row: dict, business_id: str, now_ts: str) -> str:
     return doc["id"]
 
 async def sync_bridge_product(row: dict, business_id: str, now_ts: str) -> str:
+    await assert_pos_row_scope("products", row, business_id)
     external_id = external_id_for(row)
     product_name = title_for(row, "POS Product")
     existing = await db.products.find_one(
@@ -3675,7 +3850,10 @@ async def sync_bridge_product(row: dict, business_id: str, now_ts: str) -> str:
         "source": "pos",
         "external_id": external_id,
         "pos_external_id": external_id,
+        "pos_business_id": row.get("business_id") or row.get("businessId") or "",
+        "pos_tenant_id": row.get("tenantId") or row.get("tenant_id") or "",
         "pos_synced": True,
+        "tenant_scope_status": "verified",
         "updated_at": now_ts,
     }
     if existing:
@@ -3711,6 +3889,7 @@ def known_pos_staff_password(email: str) -> str:
     return secrets.token_urlsafe(18)
 
 async def sync_bridge_staff_user(row: dict, business_id: str, now_ts: str) -> Optional[str]:
+    await assert_pos_row_scope("staff", row, business_id)
     email = (row.get("email") or "").strip().lower()
     if not email:
         return None
@@ -3722,7 +3901,10 @@ async def sync_bridge_staff_user(row: dict, business_id: str, now_ts: str) -> Op
         "role": role,
         "status": status,
         "pos_external_id": external_id_for(row),
+        "pos_business_id": row.get("business_id") or row.get("businessId") or "",
+        "pos_tenant_id": row.get("tenantId") or row.get("tenant_id") or "",
         "pos_synced": True,
+        "tenant_scope_status": "verified",
         "pos_permissions": row.get("permissions") or [],
         "pos_assigned_outlet_ids": row.get("assigned_outlet_ids") or row.get("assignedOutletIds") or [],
         "updated_at": now_ts,
@@ -3784,6 +3966,7 @@ async def local_outlet_id_for_pos_row(row: dict, business_id: str) -> str:
     return existing["id"] if existing else str(pos_outlet_id)
 
 async def sync_bridge_pos_record(config: dict, row: dict, business_id: Optional[str], user: dict, now_ts: str) -> str:
+    await assert_pos_row_scope(config.get("pos_resource") or config["label"], row, business_id)
     external_id = external_id_for(row)
     collection = db[config["collection"]]
     target_business_id = business_id or row.get("business_id") or row.get("businessId") or ""
@@ -3804,7 +3987,10 @@ async def sync_bridge_pos_record(config: dict, row: dict, business_id: Optional[
         "metadata": row,
         "resource": config.get("pos_resource") or config["label"],
         "pos_external_id": external_id,
+        "pos_business_id": row.get("business_id") or row.get("businessId") or "",
+        "pos_tenant_id": row.get("tenantId") or row.get("tenant_id") or "",
         "pos_synced": True,
+        "tenant_scope_status": "verified",
         "created_by": user["id"],
         "updated_at": now_ts,
     }
@@ -3877,7 +4063,8 @@ async def proxy_pos_bridge_resource(resource: str, request: Request, business_id
     await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
     params = {}
     payload = await pos_bridge_request(resource, params, business_id=business_id)
-    return {"resource": resource, "rows": normalize_pos_bridge_rows(payload), "raw": payload}
+    rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), business_id)
+    return {"resource": resource, "rows": rows, "raw": payload}
 
 @pos_bridge_router.post("/sync/{resource}")
 async def sync_pos_bridge_resource(resource: str, request: Request, business_id: Optional[str] = Query(None)):
@@ -3890,6 +4077,7 @@ async def sync_pos_bridge_resource(resource: str, request: Request, business_id:
     now_ts = datetime.now(timezone.utc).isoformat()
     local_business_id = business_id
     params = {}
+    await cleanup_mismatched_pos_imports(resource, local_business_id)
     try:
         payload = await pos_bridge_request(resource, params, business_id=local_business_id)
     except HTTPException as exc:
@@ -3897,7 +4085,7 @@ async def sync_pos_bridge_resource(resource: str, request: Request, business_id:
         sync_run = await record_pos_bridge_sync_run(resource, local_business_id, user, "failed", 0, 1, errors, now_ts)
         await create_audit_log(local_business_id, user["id"], user["email"], "sync_failed", f"pos_bridge:{resource}", None, {"errors": errors})
         raise HTTPException(status_code=exc.status_code, detail={**(exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}), "sync_run": sync_run}) from exc
-    rows = normalize_pos_bridge_rows(payload)
+    rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), local_business_id)
     synced = []
     errors = []
     for row in rows:
@@ -3961,6 +4149,7 @@ async def sync_pos_bridge_resource_for_system(resource: str, business_id: Option
     config = pos_bridge_resource(resource)
     now_ts = datetime.now(timezone.utc).isoformat()
     local_business_id = business_id
+    await cleanup_mismatched_pos_imports(resource, local_business_id)
     try:
         payload = await pos_bridge_request(resource, {}, business_id=local_business_id)
     except HTTPException as exc:
@@ -3971,7 +4160,7 @@ async def sync_pos_bridge_resource_for_system(resource: str, business_id: Option
             detail={**(exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}), "sync_run": sync_run},
         ) from exc
 
-    rows = normalize_pos_bridge_rows(payload)
+    rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), local_business_id)
     synced = []
     errors = []
     for row in rows:
