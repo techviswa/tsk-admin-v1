@@ -27,8 +27,8 @@ export default function ProductsPage() {
     try {
       const { data } = await api.get('/products', { params: { business_id: selectedBusiness.id } });
       setProducts(data);
-    } catch {
-      toast.error('Failed to load products');
+    } catch (err) {
+      toast.error(`Failed to load products: ${formatApiError(err)}`);
     } finally {
       setLoading(false);
     }

@@ -1525,7 +1525,23 @@ async def list_products(
         query["outlet_id"] = outlet_id
     if q:
         query["name"] = {"$regex": q, "$options": "i"}
-    return await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
+    products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
+    if business_id and not products and not q and await is_pos_connected_business(business_id):
+        now_ts = datetime.now(timezone.utc).isoformat()
+        try:
+            payload = await pos_bridge_request("products", {}, business_id=business_id)
+            rows = normalize_pos_bridge_rows(payload)
+            for row in rows:
+                await sync_bridge_product(row, business_id, now_ts)
+            products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
+        except HTTPException as exc:
+            logger.warning("Could not auto-sync POS products for business %s: %s", business_id, exc.detail)
+            raise HTTPException(status_code=exc.status_code, detail={
+                "code": "POS_PRODUCTS_SYNC_FAILED",
+                "message": exc.detail,
+                "detail": "This business is linked to POS, but AdminCore could not load POS products.",
+            }) from exc
+    return products
 
 @product_router.post("")
 async def create_product(data: ProductCreate, request: Request):
