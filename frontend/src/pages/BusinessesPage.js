@@ -215,11 +215,11 @@ export default function BusinessesPage() {
       </div>
 
       <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
-        <SheetContent className="sm:max-w-md">
-          <SheetHeader>
+        <SheetContent className="flex h-dvh flex-col overflow-hidden p-0 sm:max-w-md">
+          <SheetHeader className="shrink-0 px-6 pt-6">
             <SheetTitle className="font-heading">{editing ? 'Edit Business' : 'New Business'}</SheetTitle>
           </SheetHeader>
-          <form onSubmit={handleSubmit} className="space-y-5 mt-6">
+          <form onSubmit={handleSubmit} className="mt-6 flex-1 space-y-5 overflow-y-auto px-6 pb-8">
             <div className="space-y-2">
               <Label>Business Name</Label>
               <Input value={form.name} onChange={e => setForm({...form, name: e.target.value})} placeholder="e.g. My Restaurant" required data-testid="business-name-input" />
@@ -270,11 +270,11 @@ export default function BusinessesPage() {
       </Sheet>
 
       <Sheet open={!!retryBusiness} onOpenChange={(open) => !open && setRetryBusiness(null)}>
-        <SheetContent className="sm:max-w-md">
-          <SheetHeader>
+        <SheetContent className="flex h-dvh flex-col overflow-hidden p-0 sm:max-w-md">
+          <SheetHeader className="shrink-0 px-6 pt-6">
             <SheetTitle className="font-heading">Retry POS Provision</SheetTitle>
           </SheetHeader>
-          <form onSubmit={retryProvision} className="space-y-5 mt-6">
+          <form onSubmit={retryProvision} className="mt-6 flex-1 space-y-5 overflow-y-auto px-6 pb-8">
             <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
               This will create or relink the POS business, Main Outlet, and owner login for {retryBusiness?.name}.
             </div>
