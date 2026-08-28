@@ -22,6 +22,8 @@ const SYNC_STATUS_CLASSES = {
   failed: 'bg-red-50 text-red-700 border-red-200',
 };
 
+const POS_BRIDGE_TIMEOUT_MS = 180000;
+
 function formatSyncTime(value) {
   if (!value) return '-';
   const date = new Date(value);
@@ -71,7 +73,7 @@ export default function POSBridgePage() {
     setSyncing(resource);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      const { data } = await api.post(`/pos-bridge/sync/${resource}`, null, { params });
+      const { data } = await api.post(`/pos-bridge/sync/${resource}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
       setLastResult(data);
       toast.success(`${data.count || 0} ${resource} synced`);
       load();
@@ -86,7 +88,7 @@ export default function POSBridgePage() {
     setSyncing('all');
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      const { data } = await api.post('/pos-bridge/sync-all', null, { params });
+      const { data } = await api.post('/pos-bridge/sync-all', null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
       setLastResult(data);
       toast.success('POS bridge sync completed');
       load();
@@ -101,7 +103,7 @@ export default function POSBridgePage() {
     setPreviewing(resource.key);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      const { data } = await api.get(`/pos-bridge/proxy/${resource.key}`, { params });
+      const { data } = await api.get(`/pos-bridge/proxy/${resource.key}`, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
       setLivePreview({
         resource,
         rows: data.rows || [],

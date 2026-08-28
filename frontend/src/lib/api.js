@@ -69,6 +69,9 @@ function formatDetailValue(value) {
 
 // Format API error detail for display
 export function formatApiError(err) {
+  if (err?.code === 'ECONNABORTED') {
+    return 'Request timed out. The server did not finish in time; retry after the backend finishes waking up or check the sync health details.';
+  }
   const detail = err?.response?.data?.detail;
   if (!detail) return err?.message || 'Something went wrong';
   if (typeof detail === 'string') return detail;
