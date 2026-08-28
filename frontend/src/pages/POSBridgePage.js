@@ -22,7 +22,7 @@ const SYNC_STATUS_CLASSES = {
   failed: 'bg-red-50 text-red-700 border-red-200',
 };
 
-const POS_BRIDGE_TIMEOUT_MS = 180000;
+const POS_BRIDGE_TIMEOUT_MS = 60000;
 
 function formatSyncTime(value) {
   if (!value) return '-';
@@ -86,12 +86,28 @@ export default function POSBridgePage() {
 
   const syncAll = async () => {
     setSyncing('all');
+    const results = {};
+    setLastResult({ results });
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      const { data } = await api.post('/pos-bridge/sync-all', null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
-      setLastResult(data);
+      for (const resource of resources) {
+        setSyncing(`all:${resource.key}`);
+        try {
+          const { data } = await api.post(`/pos-bridge/sync/${resource.key}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
+          results[resource.key] = data;
+        } catch (err) {
+          results[resource.key] = {
+            resource: resource.key,
+            status: 'failed',
+            count: 0,
+            error_count: 1,
+            errors: [{ reason: formatApiError(err) }],
+          };
+        }
+        setLastResult({ results: { ...results } });
+      }
       toast.success('POS bridge sync completed');
-      load();
+      await load();
     } catch (err) {
       toast.error(formatApiError(err));
     } finally {
@@ -143,7 +159,7 @@ export default function POSBridgePage() {
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />Refresh
           </Button>
           <Button size="sm" onClick={syncAll} disabled={!config?.configured || Boolean(syncing)} className="gap-1.5 bg-blue-600 hover:bg-blue-700">
-            <RotateCw className={`h-3.5 w-3.5 ${syncing === 'all' ? 'animate-spin' : ''}`} />Sync All
+            <RotateCw className={`h-3.5 w-3.5 ${syncing.startsWith('all') ? 'animate-spin' : ''}`} />Sync All
           </Button>
         </div>
       </div>
@@ -247,7 +263,7 @@ export default function POSBridgePage() {
                         disabled={!config?.configured || Boolean(syncing)}
                         onClick={() => syncResource(resource.key)}
                       >
-                        <RotateCw className={`h-3.5 w-3.5 ${syncing === resource.key ? 'animate-spin' : ''}`} />Sync
+                        <RotateCw className={`h-3.5 w-3.5 ${syncing === resource.key || syncing === `all:${resource.key}` ? 'animate-spin' : ''}`} />Sync
                       </Button>
                     </div>
                   </TableCell>

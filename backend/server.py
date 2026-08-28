@@ -8,6 +8,7 @@ import os
 import logging
 import secrets
 import requests
+import asyncio
 import base64
 import re
 import time
@@ -35,6 +36,8 @@ POS_CORE_API_KEY = os.environ.get("POS_CORE_API_KEY", "")
 POS_CORE_OWNER_EMAIL = os.environ.get("POS_CORE_OWNER_EMAIL", "")
 POS_CORE_OWNER_PASSWORD = os.environ.get("POS_CORE_OWNER_PASSWORD", "")
 ADMINCORE_API_KEY = os.environ.get("ADMINCORE_API_KEY", "")
+POS_CORE_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("POS_CORE_REQUEST_TIMEOUT_SECONDS", "20"))
+POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS = int(os.environ.get("POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS", "45"))
 
 # ===== DATABASE =====
 mongo_url = os.environ['MONGO_URL']
@@ -131,7 +134,20 @@ def summarize_response_text(text: str) -> str:
         body = re.sub(r"<[^>]+>", " ", body)
         body = re.sub(r"\s+", " ", body).strip()
         return f"{title}: {body[:240]}"
-    return raw[:500]
+    return raw[:300]
+
+def compact_bridge_error_detail(detail) -> dict:
+    if not isinstance(detail, dict):
+        return {"message": str(detail)}
+    compact = {
+        key: value
+        for key, value in detail.items()
+        if key in ["code", "resource", "endpoint", "status_code", "url", "context", "message", "tried"]
+    }
+    response = detail.get("response")
+    if response is not None:
+        compact["response"] = summarize_response_text(response) if isinstance(response, str) else response
+    return compact
 
 def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
     response = getattr(exc, "response", None)
@@ -162,7 +178,7 @@ def pos_core_login(session: requests.Session, headers: dict):
                 login_url,
                 json={"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD},
                 headers=headers,
-                timeout=30,
+                timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             return
@@ -3291,12 +3307,17 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         last_response = None
         for index, endpoint in enumerate(endpoint_candidates):
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
-            response = session.get(url, params=request_params, headers=headers, timeout=45)
+            response = session.get(url, params=request_params, headers=headers, timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS)
             last_response = response
             if response.status_code == 404 and index < len(endpoint_candidates) - 1:
                 continue
             if resource == "businesses" and response.status_code == 404:
-                products_response = session.get(f"{POS_CORE_API_BASE_URL}/api/products", params=request_params, headers=headers, timeout=45)
+                products_response = session.get(
+                    f"{POS_CORE_API_BASE_URL}/api/products",
+                    params=request_params,
+                    headers=headers,
+                    timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS,
+                )
                 products_response.raise_for_status()
                 product_rows = normalize_pos_bridge_rows(products_response.json())
                 businesses = {}
@@ -3352,7 +3373,7 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
             json=json,
             params=params or {},
             headers=headers,
-            timeout=45,
+            timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         return response.json()
@@ -4081,10 +4102,11 @@ async def sync_pos_bridge_resource(resource: str, request: Request, business_id:
     try:
         payload = await pos_bridge_request(resource, params, business_id=local_business_id)
     except HTTPException as exc:
-        errors = [{"resource": resource, "reason": bridge_error_message(exc.detail), "detail": exc.detail}]
+        detail = compact_bridge_error_detail(exc.detail)
+        errors = [{"resource": resource, "reason": bridge_error_message(detail), "detail": detail}]
         sync_run = await record_pos_bridge_sync_run(resource, local_business_id, user, "failed", 0, 1, errors, now_ts)
         await create_audit_log(local_business_id, user["id"], user["email"], "sync_failed", f"pos_bridge:{resource}", None, {"errors": errors})
-        raise HTTPException(status_code=exc.status_code, detail={**(exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}), "sync_run": sync_run}) from exc
+        raise HTTPException(status_code=exc.status_code, detail={**detail, "sync_run": sync_run}) from exc
     rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), local_business_id)
     synced = []
     errors = []
@@ -4153,11 +4175,12 @@ async def sync_pos_bridge_resource_for_system(resource: str, business_id: Option
     try:
         payload = await pos_bridge_request(resource, {}, business_id=local_business_id)
     except HTTPException as exc:
-        errors = [{"resource": resource, "reason": bridge_error_message(exc.detail), "detail": exc.detail}]
+        detail = compact_bridge_error_detail(exc.detail)
+        errors = [{"resource": resource, "reason": bridge_error_message(detail), "detail": detail}]
         sync_run = await record_pos_bridge_sync_run(resource, local_business_id, user, "failed", 0, 1, errors, now_ts)
         raise HTTPException(
             status_code=exc.status_code,
-            detail={**(exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}), "sync_run": sync_run},
+            detail={**detail, "sync_run": sync_run},
         ) from exc
 
     rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), local_business_id)
@@ -4232,15 +4255,39 @@ async def receive_pos_bridge_sync_status(request: Request):
 
 @pos_bridge_router.post("/sync-all")
 async def sync_all_pos_bridge_resources(request: Request, business_id: Optional[str] = Query(None)):
-    await get_current_user(request)
-    results = {}
-    for resource in POS_BRIDGE_RESOURCES:
+    user = await get_current_user(request)
+    if not business_id and user.get("role") != "platform_admin":
+        raise HTTPException(status_code=400, detail="business_id is required for POS bridge sync")
+    await validate_pos_admin_business(user, business_id)
+    await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
+
+    async def sync_one(resource: str):
         try:
-            results[resource] = await sync_pos_bridge_resource(resource, request, business_id)
+            result = await asyncio.wait_for(
+                sync_pos_bridge_resource_for_system(resource, business_id, user),
+                timeout=POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS,
+            )
+            return resource, result
+        except asyncio.TimeoutError:
+            now_ts = datetime.now(timezone.utc).isoformat()
+            errors = [{
+                "resource": resource,
+                "reason": f"Timed out after {POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS} seconds",
+                "detail": {
+                    "code": "POS_BRIDGE_RESOURCE_TIMEOUT",
+                    "resource": resource,
+                    "timeout_seconds": POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS,
+                },
+            }]
+            sync_run = await record_pos_bridge_sync_run(resource, business_id, user, "failed", 0, 1, errors, now_ts)
+            return resource, {"resource": resource, "status": "failed", "count": 0, "error_count": 1, "errors": errors, "sync_run": sync_run}
         except HTTPException as exc:
-            results[resource] = {"status": "failed", "count": 0, "error_count": 1, "errors": [{"reason": bridge_error_message(exc.detail), "detail": exc.detail}]}
+            detail = compact_bridge_error_detail(exc.detail)
+            return resource, {"resource": resource, "status": "failed", "count": 0, "error_count": 1, "errors": [{"reason": bridge_error_message(detail), "detail": detail}]}
         except Exception as exc:
-            results[resource] = {"status": "failed", "count": 0, "error_count": 1, "errors": [{"reason": str(exc)}]}
+            return resource, {"resource": resource, "status": "failed", "count": 0, "error_count": 1, "errors": [{"reason": str(exc)}]}
+
+    results = dict(await asyncio.gather(*(sync_one(resource) for resource in POS_BRIDGE_RESOURCES)))
     return {"results": results}
 
 
