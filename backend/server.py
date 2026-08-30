@@ -1677,7 +1677,7 @@ async def list_products(
         now_ts = datetime.now(timezone.utc).isoformat()
         try:
             payload = await pos_bridge_request("products", {}, business_id=business_id)
-            rows = normalize_pos_bridge_rows(payload)
+            rows = await prepare_pos_bridge_rows("products", payload, business_id)
             rows = await validate_pos_rows_for_business("products", rows, business_id)
             for row in rows:
                 await sync_bridge_product(row, business_id, now_ts)
@@ -2783,6 +2783,7 @@ async def list_pos_admin_records(
     user = await get_current_user(request)
     await require_module_for_business_scope(user, business_id, POS_RESOURCE_MODULES.get(resource))
     query = await pos_business_filter(user, business_id)
+    bridge_resource = None
     if business_id and await is_pos_connected_business(business_id):
         bridge_resource = next(
             (
@@ -2814,6 +2815,15 @@ async def list_pos_admin_records(
         query["created_at"] = created
 
     collection = db[config["collection"]]
+    if business_id and bridge_resource and await collection.count_documents(query) == 0:
+        try:
+            await sync_pos_bridge_resource_for_system(bridge_resource, business_id, user)
+        except HTTPException as exc:
+            raise HTTPException(status_code=exc.status_code, detail={
+                "code": f"POS_{resource.upper().replace('-', '_')}_SYNC_FAILED",
+                "message": exc.detail,
+                "detail": f"This business is linked to POS, but AdminCore could not load POS {config['label']}.",
+            }) from exc
     records = await collection.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
     total = await collection.count_documents(query)
     status_counts = []
@@ -3242,18 +3252,18 @@ async def get_control_center_overview(request: Request, business_id: Optional[st
 pos_bridge_router = APIRouter(prefix="/pos-bridge", tags=["pos-bridge"])
 
 POS_BRIDGE_RESOURCES = {
-    "businesses": {"endpoint": "businesses", "mode": "core", "collection": "businesses", "label": "Businesses"},
-    "outlets": {"endpoint": "outlets", "mode": "core", "collection": "outlets", "label": "Outlets"},
-    "products": {"endpoint": "products", "mode": "core", "collection": "products", "label": "Products"},
-    "orders": {"endpoint": "orders", "mode": "pos_admin", "collection": "pos_sales_orders", "pos_resource": "sales-orders", "label": "Orders"},
-    "bills": {"endpoint": "billing", "mode": "pos_admin", "collection": "pos_bills", "pos_resource": "bills", "label": "Bills"},
-    "payments": {"endpoint": "payments", "endpoint_candidates": ["payments", "billing/payments", "billing"], "mode": "pos_admin", "collection": "pos_payments", "pos_resource": "payments", "label": "Payments"},
-    "tables": {"endpoint": "table-management", "mode": "pos_admin", "collection": "pos_tables", "pos_resource": "tables", "label": "Tables"},
-    "reservations": {"endpoint": "reservations", "endpoint_candidates": ["reservations", "sync/export/reservations"], "mode": "pos_admin", "collection": "pos_reservations", "pos_resource": "reservations", "label": "Reservations"},
-    "customers": {"endpoint": "customers", "endpoint_candidates": ["customers", "crm/customers"], "mode": "pos_admin", "collection": "pos_customers", "pos_resource": "customers", "label": "Customers"},
-    "kitchen-tickets": {"endpoint": "kot", "mode": "pos_admin", "collection": "pos_kitchen_kot", "pos_resource": "kitchen-kot", "label": "Kitchen Tickets"},
-    "inventory": {"endpoint": "inventory", "mode": "pos_admin", "collection": "pos_inventory_admin", "pos_resource": "inventory", "label": "Inventory"},
-    "staff-shifts": {"endpoint": "staff-shifts", "endpoint_candidates": ["staff-shifts", "staff", "attendance"], "mode": "pos_admin", "collection": "pos_staff_shifts", "pos_resource": "staff-shifts", "label": "Staff Shifts"},
+    "businesses": {"endpoint": "sync/export/businesses", "endpoint_candidates": ["sync/export/businesses", "businesses"], "mode": "core", "collection": "businesses", "label": "Businesses"},
+    "outlets": {"endpoint": "sync/export/outlets", "endpoint_candidates": ["sync/export/outlets", "outlets"], "mode": "core", "collection": "outlets", "label": "Outlets"},
+    "products": {"endpoint": "sync/export/products", "endpoint_candidates": ["sync/export/products", "products"], "mode": "core", "collection": "products", "label": "Products"},
+    "orders": {"endpoint": "sync/export/orders", "endpoint_candidates": ["sync/export/orders", "orders"], "mode": "pos_admin", "collection": "pos_sales_orders", "pos_resource": "sales-orders", "label": "Orders"},
+    "bills": {"endpoint": "billing", "endpoint_candidates": ["billing", "bills"], "mode": "pos_admin", "collection": "pos_bills", "pos_resource": "bills", "label": "Bills"},
+    "payments": {"endpoint": "billing", "endpoint_candidates": ["billing", "bills", "payments", "billing/payments"], "mode": "pos_admin", "collection": "pos_payments", "pos_resource": "payments", "label": "Payments"},
+    "tables": {"endpoint": "sync/export/tables", "endpoint_candidates": ["sync/export/tables", "table-management", "tables"], "mode": "pos_admin", "collection": "pos_tables", "pos_resource": "tables", "label": "Tables"},
+    "reservations": {"endpoint": "sync/export/reservations", "endpoint_candidates": ["sync/export/reservations", "reservations", "table-reservations"], "mode": "pos_admin", "collection": "pos_reservations", "pos_resource": "reservations", "label": "Reservations"},
+    "customers": {"endpoint": "orders", "endpoint_candidates": ["customers", "crm/customers", "orders", "billing", "bills"], "mode": "pos_admin", "collection": "pos_customers", "pos_resource": "customers", "label": "Customers"},
+    "kitchen-tickets": {"endpoint": "kot", "endpoint_candidates": ["kot", "kitchen", "billing"], "mode": "pos_admin", "collection": "pos_kitchen_kot", "pos_resource": "kitchen-kot", "label": "Kitchen Tickets"},
+    "inventory": {"endpoint": "sync/export/inventory", "endpoint_candidates": ["sync/export/inventory", "inventory"], "mode": "pos_admin", "collection": "pos_inventory_admin", "pos_resource": "inventory", "label": "Inventory"},
+    "staff-shifts": {"endpoint": "sync/export/staff", "endpoint_candidates": ["sync/export/staff", "staff-shifts", "staff", "attendance", "users"], "mode": "pos_admin", "collection": "pos_staff_shifts", "pos_resource": "staff-shifts", "label": "Staff Shifts"},
     "reports": {"endpoint": "dashboard/stats", "mode": "pos_admin", "collection": "pos_reports_analytics", "pos_resource": "reports-analytics", "label": "Reports"},
 }
 
@@ -3275,6 +3285,129 @@ def normalize_pos_bridge_rows(payload):
                 return data[key]
         return [data]
     return data if isinstance(data, list) else []
+
+def copy_row_scope(target: dict, source: dict) -> dict:
+    for key in ["business_id", "businessId", "tenant_id", "tenantId", "pos_business_id", "pos_tenant_id"]:
+        if source.get(key) and not target.get(key):
+            target[key] = source.get(key)
+    return target
+
+SCOPE_DERIVED_POS_RESOURCES = {"payments", "customers", "kitchen-tickets", "reports"}
+
+async def rows_with_expected_scope(resource: str, rows: list, business_id: Optional[str]) -> list:
+    if not business_id or resource == "businesses" or resource not in SCOPE_DERIVED_POS_RESOURCES:
+        return rows
+    scope = await expected_pos_scope_for_business(business_id)
+    scoped_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            scoped_rows.append(row)
+            continue
+        next_row = dict(row)
+        if not pos_row_business_id(next_row):
+            next_row["business_id"] = scope["business_id"]
+            next_row["businessId"] = scope["business_id"]
+        if not pos_row_tenant_id(next_row):
+            next_row["tenant_id"] = scope["tenant_id"]
+            next_row["tenantId"] = scope["tenant_id"]
+        scoped_rows.append(next_row)
+    return scoped_rows
+
+def derive_payment_rows(rows: list) -> list:
+    payments = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        bill_id = row.get("id") or row.get("invoice_id") or row.get("invoiceId")
+        nested = row.get("payments") or row.get("payment_history") or row.get("paymentHistory") or row.get("transactions") or []
+        if isinstance(nested, list) and nested:
+            for index, payment in enumerate(nested):
+                if isinstance(payment, dict):
+                    payments.append(copy_row_scope({
+                        **payment,
+                        "id": payment.get("id") or f"{bill_id}-payment-{index}",
+                        "invoice_id": bill_id,
+                        "invoiceNumber": row.get("invoiceNumber") or row.get("invoice_number"),
+                    }, row))
+            continue
+        payment_status = str(row.get("payment_status") or row.get("paymentStatus") or row.get("status") or "").lower()
+        amount = row.get("paid_amount") or row.get("paidAmount") or row.get("amount_paid") or row.get("total") or row.get("amount")
+        if payment_status in ["paid", "partial", "refunded", "failed", "reconciled"] or amount:
+            payments.append(copy_row_scope({
+                "id": f"{bill_id or external_id_for(row)}-payment",
+                "title": row.get("invoiceNumber") or row.get("invoice_number") or row.get("title") or "POS Payment",
+                "status": payment_status or "paid",
+                "amount": amount or 0,
+                "method": row.get("payment_method") or row.get("paymentMethod") or row.get("method") or "POS",
+                "invoice_id": bill_id,
+                "invoiceNumber": row.get("invoiceNumber") or row.get("invoice_number"),
+                "customerName": row.get("customerName") or row.get("customer_name"),
+                "customer_phone": row.get("customer_phone") or row.get("customerPhone"),
+            }, row))
+    return payments
+
+def derive_customer_rows(rows: list) -> list:
+    customers = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("customerName") or row.get("customer_name") or row.get("guest_name") or row.get("owner_name") or row.get("name")
+        phone = row.get("customerPhone") or row.get("customer_phone") or row.get("phone") or row.get("contact")
+        email = row.get("customerEmail") or row.get("customer_email") or row.get("email")
+        if not any([name, phone, email]):
+            continue
+        key = (email or phone or name or external_id_for(row)).strip().lower()
+        if key not in customers:
+            customers[key] = copy_row_scope({
+                "id": f"customer-{key}",
+                "name": name or email or phone or "POS Customer",
+                "email": email or "",
+                "phone": phone or "",
+                "status": "active",
+                "order_count": 0,
+                "total_spent": 0,
+            }, row)
+        customers[key]["order_count"] = int(customers[key].get("order_count") or 0) + 1
+        customers[key]["total_spent"] = float(customers[key].get("total_spent") or 0) + float(row.get("total") or row.get("amount") or 0)
+    return list(customers.values())
+
+def derive_kitchen_rows(rows: list) -> list:
+    tickets = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        items = row.get("items") or row.get("order_items") or row.get("orderItems") or []
+        kitchen_status = row.get("kitchen_status") or row.get("kitchenStatus") or row.get("status")
+        if isinstance(items, list) and items:
+            for index, item in enumerate(items):
+                ticket = item if isinstance(item, dict) else {"name": str(item)}
+                tickets.append(copy_row_scope({
+                    **ticket,
+                    "id": ticket.get("id") or f"{external_id_for(row)}-kot-{index}",
+                    "title": ticket.get("name") or ticket.get("title") or row.get("title") or "KOT Item",
+                    "status": ticket.get("status") or kitchen_status or "pending",
+                    "invoice_id": row.get("id") or row.get("invoice_id") or row.get("invoiceId"),
+                    "table_number": row.get("table_number") or row.get("tableNumber"),
+                }, row))
+        elif kitchen_status:
+            tickets.append(copy_row_scope({
+                "id": f"{external_id_for(row)}-kot",
+                "title": row.get("title") or row.get("invoiceNumber") or "KOT Ticket",
+                "status": kitchen_status,
+                "invoice_id": row.get("id") or row.get("invoice_id") or row.get("invoiceId"),
+                "table_number": row.get("table_number") or row.get("tableNumber"),
+            }, row))
+    return tickets
+
+async def prepare_pos_bridge_rows(resource: str, payload, business_id: Optional[str]) -> list:
+    rows = normalize_pos_bridge_rows(payload)
+    if resource == "payments":
+        rows = derive_payment_rows(rows)
+    elif resource == "customers":
+        rows = derive_customer_rows(rows)
+    elif resource == "kitchen-tickets":
+        rows = derive_kitchen_rows(rows)
+    return await rows_with_expected_scope(resource, rows, business_id)
 
 def pos_row_business_id(row: dict) -> str:
     business = row.get("business")
@@ -3475,7 +3608,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
 
     try:
         payload = await run_in_threadpool(do_request)
-        await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), business_id)
+        await validate_pos_rows_for_business(resource, await prepare_pos_bridge_rows(resource, payload, business_id), business_id)
         return payload
     except requests.RequestException as exc:
         detail = requests_error_detail(exc, f"POS bridge request for {resource}")
@@ -4216,7 +4349,7 @@ async def proxy_pos_bridge_resource(resource: str, request: Request, business_id
     await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
     params = {}
     payload = await pos_bridge_request(resource, params, business_id=business_id)
-    rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), business_id)
+    rows = await validate_pos_rows_for_business(resource, await prepare_pos_bridge_rows(resource, payload, business_id), business_id)
     return {"resource": resource, "rows": rows, "raw": payload}
 
 @pos_bridge_router.post("/sync/{resource}")
@@ -4239,7 +4372,7 @@ async def sync_pos_bridge_resource(resource: str, request: Request, business_id:
         sync_run = await record_pos_bridge_sync_run(resource, local_business_id, user, "failed", 0, 1, errors, now_ts)
         await create_audit_log(local_business_id, user["id"], user["email"], "sync_failed", f"pos_bridge:{resource}", None, {"errors": errors})
         raise HTTPException(status_code=exc.status_code, detail={**detail, "sync_run": sync_run}) from exc
-    rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), local_business_id)
+    rows = await validate_pos_rows_for_business(resource, await prepare_pos_bridge_rows(resource, payload, local_business_id), local_business_id)
     synced = []
     errors = []
     for row in rows:
@@ -4315,7 +4448,7 @@ async def sync_pos_bridge_resource_for_system(resource: str, business_id: Option
             detail={**detail, "sync_run": sync_run},
         ) from exc
 
-    rows = await validate_pos_rows_for_business(resource, normalize_pos_bridge_rows(payload), local_business_id)
+    rows = await validate_pos_rows_for_business(resource, await prepare_pos_bridge_rows(resource, payload, local_business_id), local_business_id)
     synced = []
     errors = []
     for row in rows:
