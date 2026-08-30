@@ -171,8 +171,10 @@ def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
             detail["response"] = summarize_response_text(response.text)
     return detail
 
-def pos_core_login(session: requests.Session, headers: dict):
-    if not POS_CORE_OWNER_EMAIL or not POS_CORE_OWNER_PASSWORD:
+def pos_core_login(session: requests.Session, headers: dict, email: Optional[str] = None, password: Optional[str] = None):
+    login_email = (email or POS_CORE_OWNER_EMAIL or "").strip().lower()
+    login_password = password or POS_CORE_OWNER_PASSWORD
+    if not login_email or not login_password:
         return
     login_url = f"{POS_CORE_API_BASE_URL}/api/auth/login"
     last_exc = None
@@ -180,7 +182,7 @@ def pos_core_login(session: requests.Session, headers: dict):
         try:
             response = session.post(
                 login_url,
-                json={"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD},
+                json={"email": login_email, "password": login_password},
                 headers=headers,
                 timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS,
             )
@@ -207,6 +209,16 @@ async def mark_business_pos_status(business_id: str, status: str, error=None, ex
     if extra:
         update.update(extra)
     await db.businesses.update_one({"id": business_id}, {"$set": update})
+
+def sanitize_business_doc(business: Optional[dict]) -> Optional[dict]:
+    if not business:
+        return business
+    sanitized = {k: v for k, v in business.items() if k not in ["_id", "pos_owner_password"]}
+    sanitized["pos_owner_password_set"] = bool(business.get("pos_owner_password"))
+    return sanitized
+
+def sanitize_business_docs(businesses: list) -> list:
+    return [sanitize_business_doc(business) for business in businesses]
 
 async def rollback_failed_business_create(business_id: str, actor_id: str, owner_email: str = ""):
     cleanup_collections = [
@@ -1360,7 +1372,7 @@ async def list_businesses(request: Request):
         businesses = await db.businesses.find({}, {"_id": 0}).to_list(100)
     else:
         businesses = await db.businesses.find({"id": {"$in": user.get("business_ids", [])}}, {"_id": 0}).to_list(100)
-    return businesses
+    return sanitize_business_docs(businesses)
 
 @business_router.post("")
 async def create_business(data: BusinessCreate, request: Request):
@@ -1402,6 +1414,7 @@ async def create_business(data: BusinessCreate, request: Request):
         "pos_provisioning_status": "pending" if POS_CORE_API_BASE_URL else "not_configured",
         "pos_provisioning_error": "",
         "pos_owner_email": owner_email,
+        "pos_owner_password": owner_password if POS_CORE_API_BASE_URL else "",
         "created_at": now_ts,
         "updated_at": now_ts,
     }
@@ -1451,7 +1464,7 @@ async def create_business(data: BusinessCreate, request: Request):
         created_qr_code = qr_code_response({k: v for k, v in qr_doc.items() if k != "_id"}, request)
     created_doc = await db.businesses.find_one({"id": biz_id}, {"_id": 0})
     return {
-        **created_doc,
+        **sanitize_business_doc(created_doc),
         "created_owner": owner,
         "created_outlet": created_outlet,
         "created_qr_code": created_qr_code,
@@ -1478,6 +1491,10 @@ async def provision_business_to_pos_endpoint(business_id: str, data: BusinessPro
         owner_email,
         owner_password,
     )
+    await db.businesses.update_one(
+        {"id": business_id},
+        {"$set": {"pos_owner_email": owner_email, "pos_owner_password": owner_password, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
     job = await queue_pos_provisioning_job(
         business_id,
         data.owner_name,
@@ -1488,12 +1505,12 @@ async def provision_business_to_pos_endpoint(business_id: str, data: BusinessPro
     asyncio.create_task(process_due_pos_provisioning_jobs(limit=1))
     await create_audit_log(business_id, user["id"], user["email"], "provision_queued", "business", business_id, {"target": "pos", "job_id": job["id"]})
     business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
-    return {"message": "POS provisioning queued", "job": job, "business": business}
+    return {"message": "POS provisioning queued", "job": job, "business": sanitize_business_doc(business)}
 
 @business_router.get("/{business_id}")
 async def get_business(business_id: str, request: Request):
     user = await get_current_user(request)
-    return await validate_business_access(user, business_id)
+    return sanitize_business_doc(await validate_business_access(user, business_id))
 
 @business_router.put("/{business_id}")
 async def update_business(business_id: str, data: BusinessUpdate, request: Request):
@@ -1507,7 +1524,7 @@ async def update_business(business_id: str, data: BusinessUpdate, request: Reque
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Business not found")
     await create_audit_log(business_id, user["id"], user["email"], "updated", "business", business_id, update_data)
-    return await db.businesses.find_one({"id": business_id}, {"_id": 0})
+    return sanitize_business_doc(await db.businesses.find_one({"id": business_id}, {"_id": 0}))
 
 @business_router.delete("/{business_id}")
 async def delete_business(business_id: str, request: Request):
@@ -1677,10 +1694,10 @@ async def list_products(
     if q:
         query["name"] = {"$regex": q, "$options": "i"}
     query["tenant_scope_status"] = {"$ne": "quarantined"}
-    if business_id and await is_pos_connected_business(business_id):
+    pos_connected = business_id and await is_pos_connected_business(business_id)
+    if pos_connected:
         await cleanup_mismatched_pos_imports("products", business_id)
-    products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
-    if business_id and not products and not q and await is_pos_connected_business(business_id):
+    if pos_connected and not q and not outlet_id:
         now_ts = datetime.now(timezone.utc).isoformat()
         try:
             payload = await pos_bridge_request("products", {}, business_id=business_id)
@@ -1688,7 +1705,6 @@ async def list_products(
             rows = await validate_pos_rows_for_business("products", rows, business_id)
             for row in rows:
                 await sync_bridge_product(row, business_id, now_ts)
-            products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
         except HTTPException as exc:
             logger.warning("Could not auto-sync POS products for business %s: %s", business_id, exc.detail)
             raise HTTPException(status_code=exc.status_code, detail={
@@ -1696,6 +1712,7 @@ async def list_products(
                 "message": exc.detail,
                 "detail": "This business is linked to POS, but AdminCore could not load POS products.",
             }) from exc
+    products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
     return products
 
 @product_router.post("")
@@ -2822,7 +2839,8 @@ async def list_pos_admin_records(
         query["created_at"] = created
 
     collection = db[config["collection"]]
-    if business_id and bridge_resource and await collection.count_documents(query) == 0:
+    has_filters = bool(outlet_id or search or date_from or date_to or (status and status != "all"))
+    if business_id and bridge_resource and not has_filters:
         try:
             await sync_pos_bridge_resource_for_system(bridge_resource, business_id, user)
         except HTTPException as exc:
@@ -3564,6 +3582,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
     if POS_CORE_API_KEY:
         headers["Authorization"] = f"Bearer {POS_CORE_API_KEY}"
         headers["x-api-key"] = POS_CORE_API_KEY
+    login = await pos_login_for_admin_business(business_id)
     if business_id:
         headers.update(await pos_headers_for_admin_business(business_id))
     request_params = dict(params or {})
@@ -3575,7 +3594,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
 
     def do_request():
         session = requests.Session()
-        pos_core_login(session, headers)
+        pos_core_login(session, headers, login.get("email"), login.get("password"))
         last_response = None
         for index, endpoint in enumerate(endpoint_candidates):
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
@@ -3627,7 +3646,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         })
         raise HTTPException(status_code=502, detail=detail) from exc
 
-async def pos_core_session_request(method: str, endpoint: str, json: dict | None = None, params: dict | None = None, extra_headers: Optional[dict] = None):
+async def pos_core_session_request(method: str, endpoint: str, json: dict | None = None, params: dict | None = None, extra_headers: Optional[dict] = None, login_email: Optional[str] = None, login_password: Optional[str] = None):
     ensure_pos_bridge_config()
     headers = {}
     if POS_CORE_API_KEY:
@@ -3638,7 +3657,7 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
 
     def do_request():
         session = requests.Session()
-        pos_core_login(session, headers)
+        pos_core_login(session, headers, login_email, login_password)
         response = session.request(
             method,
             f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}",
@@ -3667,6 +3686,29 @@ async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
         "tenant_id": provisioned["tenant_id"],
         "tenantId": provisioned["tenant_id"],
         "x-tenant-id": provisioned["tenant_id"],
+    }
+
+async def pos_login_for_admin_business(business_id: Optional[str]) -> dict:
+    if not business_id:
+        return {"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD}
+    business = await db.businesses.find_one(
+        {"id": business_id},
+        {"_id": 0, "pos_owner_email": 1, "pos_owner_password": 1},
+    )
+    if not business:
+        return {"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD}
+    owner_email = business.get("pos_owner_email") or ""
+    owner_password = business.get("pos_owner_password") or ""
+    if owner_email and not owner_password:
+        raise HTTPException(status_code=409, detail={
+            "code": "POS_OWNER_PASSWORD_REQUIRED",
+            "message": "AdminCore needs the POS owner password for this business before it can sync POS data. Retry POS provisioning with the owner password.",
+            "business_id": business_id,
+            "pos_owner_email": owner_email,
+        })
+    return {
+        "email": owner_email or POS_CORE_OWNER_EMAIL,
+        "password": owner_password or POS_CORE_OWNER_PASSWORD,
     }
 
 def admin_role_to_pos_role(role: str) -> str:
@@ -3796,6 +3838,7 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
     if not user_doc.get("email"):
         return None
     business_id = business_ids[0]
+    login = await pos_login_for_admin_business(business_id)
     pos_headers = await pos_headers_for_admin_business(business_id)
     business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
     outlet = await ensure_default_outlet_for_business(
@@ -3829,7 +3872,7 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
             raise HTTPException(status_code=400, detail="Set a new password before syncing this user to POS")
         payload["password"] = secrets.token_urlsafe(10)
 
-    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers)
+    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
     created = result.get("data") if isinstance(result, dict) and "data" in result else result
     pos_user_id = created.get("id") if isinstance(created, dict) else None
     created_business_id = str((created or {}).get("business_id") or (created or {}).get("businessId") or "")
@@ -3859,8 +3902,9 @@ async def push_admin_product_to_pos(product_doc: dict):
     business_id = product_doc.get("business_id")
     if not POS_CORE_API_BASE_URL or not business_id:
         return None
+    login = await pos_login_for_admin_business(business_id)
     pos_headers = await pos_headers_for_admin_business(business_id)
-    product_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "products", extra_headers=pos_headers))
+    product_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "products", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password")))
     existing = next(
         (
             row for row in product_rows
@@ -3877,10 +3921,10 @@ async def push_admin_product_to_pos(product_doc: dict):
         "active": product_doc.get("active", True),
     }
     if existing:
-        result = await pos_core_session_request("PUT", f"products/{existing['id']}", json=payload, extra_headers=pos_headers)
+        result = await pos_core_session_request("PUT", f"products/{existing['id']}", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
         pos_product_id = existing["id"]
     else:
-        result = await pos_core_session_request("POST", "products", json=payload, extra_headers=pos_headers)
+        result = await pos_core_session_request("POST", "products", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_product_id = created.get("id") if isinstance(created, dict) else None
     if pos_product_id:
@@ -3893,15 +3937,17 @@ async def push_admin_product_to_pos(product_doc: dict):
 async def delete_admin_product_from_pos(product_doc: dict):
     if not POS_CORE_API_BASE_URL or not product_doc.get("business_id") or not product_doc.get("pos_external_id"):
         return None
+    login = await pos_login_for_admin_business(product_doc["business_id"])
     pos_headers = await pos_headers_for_admin_business(product_doc["business_id"])
-    return await pos_core_session_request("DELETE", f"products/{product_doc['pos_external_id']}", extra_headers=pos_headers)
+    return await pos_core_session_request("DELETE", f"products/{product_doc['pos_external_id']}", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
 
 async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict] = None):
     business_id = outlet_doc.get("business_id")
     if not POS_CORE_API_BASE_URL or not business_id:
         return None
+    login = await pos_login_for_admin_business(business_id)
     pos_headers = pos_headers or await pos_headers_for_admin_business(business_id)
-    outlet_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "outlets", extra_headers=pos_headers))
+    outlet_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "outlets", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password")))
     outlet_name = (outlet_doc.get("name") or "").strip().lower()
     outlet_code = (outlet_doc.get("code") or "").strip().lower()
     existing = next(
@@ -3927,10 +3973,10 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
         "tenant_id": outlet_doc.get("pos_tenant_id") or pos_headers.get("x-tenant-id") or "",
     }
     if existing:
-        result = await pos_core_session_request("PUT", f"outlets/{existing['id']}", json=payload, extra_headers=pos_headers)
+        result = await pos_core_session_request("PUT", f"outlets/{existing['id']}", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
         pos_outlet_id = existing["id"]
     else:
-        result = await pos_core_session_request("POST", "outlets", json=payload, extra_headers=pos_headers)
+        result = await pos_core_session_request("POST", "outlets", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_outlet_id = created.get("id") if isinstance(created, dict) else None
     if pos_outlet_id:
@@ -3949,8 +3995,9 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
 async def delete_admin_outlet_from_pos(outlet_doc: dict):
     if not POS_CORE_API_BASE_URL or not outlet_doc.get("business_id") or not outlet_doc.get("pos_external_id"):
         return None
+    login = await pos_login_for_admin_business(outlet_doc["business_id"])
     pos_headers = await pos_headers_for_admin_business(outlet_doc["business_id"])
-    return await pos_core_session_request("DELETE", f"outlets/{outlet_doc['pos_external_id']}", extra_headers=pos_headers)
+    return await pos_core_session_request("DELETE", f"outlets/{outlet_doc['pos_external_id']}", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
 
 def external_id_for(row: dict) -> str:
     return str(row.get("id") or row.get("_id") or row.get("external_id") or row.get("code") or row.get("trackingToken") or ObjectId())
