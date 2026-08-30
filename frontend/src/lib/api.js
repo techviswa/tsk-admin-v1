@@ -14,6 +14,58 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+const ACCESS_TOKEN_KEY = 'admincore_access_token';
+const REFRESH_TOKEN_KEY = 'admincore_refresh_token';
+
+export function setAuthTokens(accessToken, refreshToken) {
+  if (accessToken) localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
+  if (refreshToken) localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+}
+
+export function clearAuthTokens() {
+  localStorage.removeItem(ACCESS_TOKEN_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
+}
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+  if (token) {
+    config.headers = config.headers || {};
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+api.interceptors.response.use(
+  response => response,
+  async (error) => {
+    const original = error.config;
+    const status = error?.response?.status;
+    const isAuthRequest = original?.url?.startsWith('/auth/login') || original?.url?.startsWith('/auth/register') || original?.url?.startsWith('/auth/refresh');
+    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
+
+    if (status === 401 && original && !original._retry && !isAuthRequest && refreshToken) {
+      original._retry = true;
+      try {
+        const { data } = await axios.post(`${API_URL}/api/auth/refresh`, null, {
+          withCredentials: true,
+          headers: { 'X-Refresh-Token': refreshToken },
+          timeout: 15000,
+        });
+        setAuthTokens(data.access_token, data.refresh_token);
+        original.headers = original.headers || {};
+        original.headers.Authorization = `Bearer ${data.access_token}`;
+        return api(original);
+      } catch (refreshError) {
+        clearAuthTokens();
+        return Promise.reject(refreshError);
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
 function compact(value) {
   return String(value ?? '').trim();
 }

@@ -91,7 +91,7 @@ async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
+        if auth_header.lower().startswith("bearer "):
             token = auth_header[7:]
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -1170,7 +1170,8 @@ async def login(req: LoginRequest, response: Response):
         await create_audit_log(None, user_id, email, "login", "auth")
     except PyMongoError as exc:
         logger.warning("Login succeeded but audit log write failed: %s", exc)
-    return {"id": user_id, "email": user["email"], "name": user["name"], "role": user["role"], "business_ids": user.get("business_ids", []), "status": user.get("status", "active")}
+    user_payload = {"id": user_id, "email": user["email"], "name": user["name"], "role": user["role"], "business_ids": user.get("business_ids", []), "status": user.get("status", "active")}
+    return {**user_payload, "user": user_payload, "access_token": access, "refresh_token": refresh}
 
 @auth_router.post("/register")
 async def register(req: RegisterRequest, response: Response):
@@ -1183,7 +1184,8 @@ async def register(req: RegisterRequest, response: Response):
     access = create_access_token(user_id, email)
     refresh = create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
-    return {"id": user_id, "email": email, "name": req.name, "role": "business_owner", "business_ids": [], "status": "active"}
+    user_payload = {"id": user_id, "email": email, "name": req.name, "role": "business_owner", "business_ids": [], "status": "active"}
+    return {**user_payload, "user": user_payload, "access_token": access, "refresh_token": refresh}
 
 @auth_router.get("/me")
 async def get_me(request: Request):
@@ -1197,7 +1199,11 @@ async def logout(response: Response):
 
 @auth_router.post("/refresh")
 async def refresh_token(request: Request, response: Response):
-    token = request.cookies.get("refresh_token")
+    token = request.cookies.get("refresh_token") or request.headers.get("X-Refresh-Token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:]
     if not token:
         raise HTTPException(status_code=401, detail="No refresh token")
     try:
@@ -1208,8 +1214,9 @@ async def refresh_token(request: Request, response: Response):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         access = create_access_token(user["id"], user["email"])
-        set_auth_cookies(response, access)
-        return {"message": "Token refreshed"}
+        refresh = create_refresh_token(user["id"])
+        set_auth_cookies(response, access, refresh)
+        return {"message": "Token refreshed", "access_token": access, "refresh_token": refresh}
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh token expired")
     except pyjwt.InvalidTokenError:
@@ -5078,6 +5085,7 @@ allowed_origins = list(dict.fromkeys([
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=os.environ.get("CORS_ORIGIN_REGEX", r"https://.*\.vercel\.app"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
