@@ -70,7 +70,7 @@ export default function BusinessesPage() {
         toast.success('Business updated');
       } else {
         await api.post('/businesses', form);
-        toast.success('Business created and provisioned to POS');
+        toast.success('Business created; POS provisioning queued');
       }
       setSheetOpen(false);
       fetchBusinesses();
@@ -118,7 +118,7 @@ export default function BusinessesPage() {
     setRetryingId(retryBusiness.id);
     try {
       await api.post(`/businesses/${retryBusiness.id}/provision-pos`, retryForm);
-      toast.success('Business provisioned to POS');
+      toast.success('POS provisioning retry queued');
       setRetryBusiness(null);
       fetchBusinesses();
       refreshBusinesses();

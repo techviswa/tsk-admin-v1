@@ -38,6 +38,10 @@ POS_CORE_OWNER_PASSWORD = os.environ.get("POS_CORE_OWNER_PASSWORD", "")
 ADMINCORE_API_KEY = os.environ.get("ADMINCORE_API_KEY", "")
 POS_CORE_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("POS_CORE_REQUEST_TIMEOUT_SECONDS", "20"))
 POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS = int(os.environ.get("POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS", "45"))
+POS_PROVISIONING_MAX_ATTEMPTS = int(os.environ.get("POS_PROVISIONING_MAX_ATTEMPTS", "6"))
+POS_PROVISIONING_WORKER_ENABLED = os.environ.get("POS_PROVISIONING_WORKER_ENABLED", "true").lower() != "false"
+POS_PROVISIONING_WORKER_INTERVAL_SECONDS = int(os.environ.get("POS_PROVISIONING_WORKER_INTERVAL_SECONDS", "30"))
+POS_PROVISIONING_RETRY_DELAYS_SECONDS = [30, 60, 180, 300, 600, 900]
 
 # ===== DATABASE =====
 mongo_url = os.environ['MONGO_URL']
@@ -244,6 +248,116 @@ async def rollback_failed_business_create(business_id: str, actor_id: str, owner
             else:
                 await db.users.update_one({"id": owner["id"]}, {"$set": {"business_ids": [], "updated_at": datetime.now(timezone.utc).isoformat()}})
 
+def next_pos_provisioning_retry_at(attempts: int) -> str:
+    delay = POS_PROVISIONING_RETRY_DELAYS_SECONDS[min(max(attempts - 1, 0), len(POS_PROVISIONING_RETRY_DELAYS_SECONDS) - 1)]
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+
+async def queue_pos_provisioning_job(
+    business_id: str,
+    owner_name: Optional[str],
+    owner_email: Optional[str],
+    owner_password: Optional[str],
+    actor: Optional[dict],
+    run_after: Optional[str] = None,
+) -> dict:
+    now_ts = datetime.now(timezone.utc).isoformat()
+    job = {
+        "id": str(ObjectId()),
+        "business_id": business_id,
+        "owner_name": owner_name or "",
+        "owner_email": (owner_email or "").strip().lower(),
+        "owner_password": owner_password or "",
+        "actor_id": (actor or {}).get("id", "system"),
+        "actor_email": (actor or {}).get("email", "system"),
+        "status": "pending",
+        "attempts": 0,
+        "max_attempts": POS_PROVISIONING_MAX_ATTEMPTS,
+        "last_error": "",
+        "run_after": run_after or now_ts,
+        "created_at": now_ts,
+        "updated_at": now_ts,
+    }
+    await db.pos_provisioning_jobs.update_many(
+        {"business_id": business_id, "status": {"$in": ["pending", "retrying"]}},
+        {"$set": {"status": "superseded", "updated_at": now_ts}},
+    )
+    await db.pos_provisioning_jobs.insert_one(job)
+    await mark_business_pos_status(
+        business_id,
+        "pending",
+        extra={"pos_provisioning_job_id": job["id"], "pos_provisioning_error": ""},
+    )
+    return {k: v for k, v in job.items() if k not in ["_id", "owner_password"]}
+
+async def run_pos_provisioning_job(job: dict):
+    business_id = job.get("business_id")
+    if not business_id:
+        return
+    attempts = int(job.get("attempts") or 0) + 1
+    now_ts = datetime.now(timezone.utc).isoformat()
+    actor = {
+        "id": job.get("actor_id") or "system",
+        "email": job.get("actor_email") or "system",
+    }
+    await db.pos_provisioning_jobs.update_one(
+        {"id": job["id"]},
+        {"$set": {"status": "running", "attempts": attempts, "last_attempt_at": now_ts, "updated_at": now_ts}},
+    )
+    try:
+        result = await provision_business_end_to_end(
+            business_id,
+            owner_name=job.get("owner_name"),
+            owner_email=job.get("owner_email"),
+            owner_password=job.get("owner_password"),
+            actor=actor,
+            enqueue_on_failure=False,
+        )
+        await db.pos_provisioning_jobs.update_one(
+            {"id": job["id"]},
+            {"$set": {"status": "synced", "result": result, "owner_password": "", "finished_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    except Exception as exc:
+        detail = pos_error_detail(exc)
+        status = "failed" if attempts >= int(job.get("max_attempts") or POS_PROVISIONING_MAX_ATTEMPTS) else "retrying"
+        update = {
+            "status": status,
+            "last_error": detail,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if status == "retrying":
+            update["run_after"] = next_pos_provisioning_retry_at(attempts)
+        else:
+            update["owner_password"] = ""
+            update["finished_at"] = datetime.now(timezone.utc).isoformat()
+        await db.pos_provisioning_jobs.update_one({"id": job["id"]}, {"$set": update})
+        await mark_business_pos_status(business_id, "failed" if status == "failed" else "pending", detail)
+
+async def process_due_pos_provisioning_jobs(limit: int = 3):
+    now_ts = datetime.now(timezone.utc).isoformat()
+    stale_running_before = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    await db.pos_provisioning_jobs.update_many(
+        {"status": "running", "updated_at": {"$lte": stale_running_before}},
+        {"$set": {"status": "retrying", "run_after": now_ts, "updated_at": now_ts}},
+    )
+    cursor = db.pos_provisioning_jobs.find(
+        {
+            "status": {"$in": ["pending", "retrying"]},
+            "run_after": {"$lte": now_ts},
+            "attempts": {"$lt": POS_PROVISIONING_MAX_ATTEMPTS},
+        },
+        {"_id": 0},
+    ).sort("created_at", 1).limit(limit)
+    async for job in cursor:
+        await run_pos_provisioning_job(job)
+
+async def pos_provisioning_worker():
+    while True:
+        try:
+            await process_due_pos_provisioning_jobs()
+        except Exception as exc:
+            logger.warning("POS provisioning worker failed: %s", exc)
+        await asyncio.sleep(POS_PROVISIONING_WORKER_INTERVAL_SECONDS)
+
 async def ensure_business_owner_user(
     business_id: str,
     owner_name: Optional[str],
@@ -286,6 +400,7 @@ async def provision_business_end_to_end(
     owner_email: Optional[str] = None,
     owner_password: Optional[str] = None,
     actor: Optional[dict] = None,
+    enqueue_on_failure: bool = True,
 ) -> dict:
     if not POS_CORE_API_BASE_URL:
         await mark_business_pos_status(business_id, "not_configured")
@@ -322,6 +437,8 @@ async def provision_business_end_to_end(
         return {"configured": True, "business": provisioned, "owner": {k: v for k, v in owner.items() if k != "password_hash"}, "outlet": outlet}
     except Exception as exc:
         detail = pos_error_detail(exc)
+        if enqueue_on_failure:
+            await queue_pos_provisioning_job(business_id, owner_name, owner_email, owner_password, actor, next_pos_provisioning_retry_at(1))
         await mark_business_pos_status(business_id, "failed", detail)
         if actor:
             await create_audit_log(business_id, actor["id"], actor["email"], "provision_failed", "business", business_id, {"error": detail})
@@ -1285,29 +1402,23 @@ async def create_business(data: BusinessCreate, request: Request):
     await db.users.update_one({"id": user["id"]}, {"$addToSet": {"business_ids": biz_id}})
     await seed_business_defaults(biz_id)
     await create_audit_log(biz_id, user["id"], user["email"], "created", "business", biz_id, {"name": data.name})
-    pos_provisioned = None
-    try:
-        pos_provisioned = await provision_business_end_to_end(
+    owner = await ensure_business_owner_user(
+        biz_id,
+        owner_name or data.name,
+        owner_email,
+        owner_password,
+    )
+    created_outlet = await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=False)
+    pos_job = None
+    if POS_CORE_API_BASE_URL:
+        pos_job = await queue_pos_provisioning_job(
             biz_id,
             owner_name=owner_name or data.name,
             owner_email=owner_email,
             owner_password=owner_password,
             actor=user,
         )
-    except HTTPException as exc:
-        detail = exc.detail
-        logger.warning("POS provisioning failed for new business %s: %s", biz_id, detail)
-        await rollback_failed_business_create(biz_id, user["id"], owner_email)
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "POS_PROVISIONING_FAILED",
-                "message": detail,
-                "rolled_back": True,
-                "detail": "AdminCore did not keep this business because POS provisioning failed. Fix the POS error and create it again.",
-            },
-        ) from exc
-    created_outlet = await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=not POS_CORE_API_BASE_URL)
+        asyncio.create_task(process_due_pos_provisioning_jobs(limit=1))
     created_qr_code = None
     if qr_setup_mode == "local":
         outlet_doc = created_outlet or await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=bool(POS_CORE_API_BASE_URL))
@@ -1332,7 +1443,14 @@ async def create_business(data: BusinessCreate, request: Request):
         await create_audit_log(biz_id, user["id"], user["email"], "created", "qr_code", qr_doc["id"], {"name": qr_doc["name"], "type": qr_doc["type"]})
         created_qr_code = qr_code_response({k: v for k, v in qr_doc.items() if k != "_id"}, request)
     created_doc = await db.businesses.find_one({"id": biz_id}, {"_id": 0})
-    return {**created_doc, "created_outlet": created_outlet, "created_qr_code": created_qr_code, "pos_provisioned": bool(pos_provisioned)}
+    return {
+        **created_doc,
+        "created_owner": owner,
+        "created_outlet": created_outlet,
+        "created_qr_code": created_qr_code,
+        "pos_provisioned": False,
+        "pos_provisioning_job": pos_job,
+    }
 
 @business_router.post("/{business_id}/provision-pos")
 async def provision_business_to_pos_endpoint(business_id: str, data: BusinessProvisionRequest, request: Request):
@@ -1340,16 +1458,30 @@ async def provision_business_to_pos_endpoint(business_id: str, data: BusinessPro
     if user["role"] not in ["platform_admin", "business_owner"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     await validate_business_access(user, business_id)
-    result = await provision_business_end_to_end(
+    owner_email = (data.owner_email or "").strip().lower()
+    owner_password = data.owner_password or ""
+    if POS_CORE_API_BASE_URL:
+        if not owner_email:
+            raise HTTPException(status_code=400, detail="Owner email is required so the business can login to POS")
+        if not owner_password or len(owner_password) < 6:
+            raise HTTPException(status_code=400, detail="Owner password must be at least 6 characters")
+    await ensure_business_owner_user(
         business_id,
-        owner_name=data.owner_name,
-        owner_email=data.owner_email,
-        owner_password=data.owner_password,
-        actor=user,
+        data.owner_name,
+        owner_email,
+        owner_password,
     )
-    await create_audit_log(business_id, user["id"], user["email"], "provisioned", "business", business_id, {"target": "pos"})
+    job = await queue_pos_provisioning_job(
+        business_id,
+        data.owner_name,
+        owner_email,
+        owner_password,
+        user,
+    )
+    asyncio.create_task(process_due_pos_provisioning_jobs(limit=1))
+    await create_audit_log(business_id, user["id"], user["email"], "provision_queued", "business", business_id, {"target": "pos", "job_id": job["id"]})
     business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
-    return {"message": "Business provisioned to POS", "result": result, "business": business}
+    return {"message": "POS provisioning queued", "job": job, "business": business}
 
 @business_router.get("/{business_id}")
 async def get_business(business_id: str, request: Request):
@@ -4772,6 +4904,9 @@ async def startup():
     await db.billing_events.create_index([("business_id", 1), ("created_at", -1)])
     await db.pos_bridge_sync_runs.create_index([("resource", 1), ("business_id", 1), ("created_at", -1)])
     await db.pos_bridge_sync_runs.create_index("status")
+    await db.pos_provisioning_jobs.create_index("id", unique=True)
+    await db.pos_provisioning_jobs.create_index([("status", 1), ("run_after", 1)])
+    await db.pos_provisioning_jobs.create_index([("business_id", 1), ("created_at", -1)])
     for config in POS_ADMIN_RESOURCES.values():
         collection = db[config["collection"]]
         await collection.create_index("id", unique=True)
@@ -4784,6 +4919,8 @@ async def startup():
         collection = db[config["collection"]]
         await collection.create_index("pos_external_id")
         await collection.create_index("pos_synced")
+    if POS_PROVISIONING_WORKER_ENABLED:
+        asyncio.create_task(pos_provisioning_worker())
     logger.info("Database indexes created")
 
 
