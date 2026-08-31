@@ -3692,15 +3692,28 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
 async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
     if not business_id:
         return {}
-    provisioned = await provision_admin_business_to_pos(business_id)
-    if not provisioned:
+    business = await db.businesses.find_one(
+        {"id": business_id},
+        {"_id": 0, "id": 1, "pos_external_id": 1, "pos_tenant_id": 1},
+    )
+    if not business:
         return {}
+    pos_business_id = str(business.get("pos_external_id") or business.get("id") or business_id)
+    tenant_id = str(business.get("pos_tenant_id") or f"admincore-{business_id}")
+    update = {}
+    if not business.get("pos_external_id"):
+        update["pos_external_id"] = pos_business_id
+    if not business.get("pos_tenant_id"):
+        update["pos_tenant_id"] = tenant_id
+    if update:
+        update["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await db.businesses.update_one({"id": business_id}, {"$set": update})
     return {
-        "business_id": provisioned["business_id"],
-        "x-business-id": provisioned["business_id"],
-        "tenant_id": provisioned["tenant_id"],
-        "tenantId": provisioned["tenant_id"],
-        "x-tenant-id": provisioned["tenant_id"],
+        "business_id": pos_business_id,
+        "x-business-id": pos_business_id,
+        "tenant_id": tenant_id,
+        "tenantId": tenant_id,
+        "x-tenant-id": tenant_id,
     }
 
 def admin_role_to_pos_role(role: str) -> str:
