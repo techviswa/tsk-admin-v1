@@ -3288,15 +3288,15 @@ POS_BRIDGE_RESOURCES = {
     "outlets": {"endpoint": "sync/export/outlets", "endpoint_candidates": ["sync/export/outlets", "outlets"], "mode": "core", "collection": "outlets", "label": "Outlets"},
     "products": {"endpoint": "sync/export/products", "endpoint_candidates": ["sync/export/products", "products"], "mode": "core", "collection": "products", "label": "Products"},
     "orders": {"endpoint": "sync/export/orders", "endpoint_candidates": ["sync/export/orders", "orders"], "mode": "pos_admin", "collection": "pos_sales_orders", "pos_resource": "sales-orders", "label": "Orders"},
-    "bills": {"endpoint": "billing", "endpoint_candidates": ["billing", "bills"], "mode": "pos_admin", "collection": "pos_bills", "pos_resource": "bills", "label": "Bills"},
-    "payments": {"endpoint": "billing", "endpoint_candidates": ["billing", "bills", "payments", "billing/payments"], "mode": "pos_admin", "collection": "pos_payments", "pos_resource": "payments", "label": "Payments"},
+    "bills": {"endpoint": "sync/export/bills", "endpoint_candidates": ["sync/export/bills", "billing", "bills"], "mode": "pos_admin", "collection": "pos_bills", "pos_resource": "bills", "label": "Bills"},
+    "payments": {"endpoint": "sync/export/payments", "endpoint_candidates": ["sync/export/payments", "billing", "bills", "payments", "billing/payments"], "mode": "pos_admin", "collection": "pos_payments", "pos_resource": "payments", "label": "Payments"},
     "tables": {"endpoint": "sync/export/tables", "endpoint_candidates": ["sync/export/tables", "table-management", "tables"], "mode": "pos_admin", "collection": "pos_tables", "pos_resource": "tables", "label": "Tables"},
     "reservations": {"endpoint": "sync/export/reservations", "endpoint_candidates": ["sync/export/reservations", "reservations", "table-reservations"], "mode": "pos_admin", "collection": "pos_reservations", "pos_resource": "reservations", "label": "Reservations"},
-    "customers": {"endpoint": "orders", "endpoint_candidates": ["customers", "crm/customers", "orders", "billing", "bills"], "mode": "pos_admin", "collection": "pos_customers", "pos_resource": "customers", "label": "Customers"},
-    "kitchen-tickets": {"endpoint": "kot", "endpoint_candidates": ["kot", "kitchen", "billing"], "mode": "pos_admin", "collection": "pos_kitchen_kot", "pos_resource": "kitchen-kot", "label": "Kitchen Tickets"},
+    "customers": {"endpoint": "sync/export/customers", "endpoint_candidates": ["sync/export/customers", "customers", "crm/customers", "orders", "billing", "bills"], "mode": "pos_admin", "collection": "pos_customers", "pos_resource": "customers", "label": "Customers"},
+    "kitchen-tickets": {"endpoint": "sync/export/kot", "endpoint_candidates": ["sync/export/kot", "kot", "kitchen", "billing"], "mode": "pos_admin", "collection": "pos_kitchen_kot", "pos_resource": "kitchen-kot", "label": "Kitchen Tickets"},
     "inventory": {"endpoint": "sync/export/inventory", "endpoint_candidates": ["sync/export/inventory", "inventory"], "mode": "pos_admin", "collection": "pos_inventory_admin", "pos_resource": "inventory", "label": "Inventory"},
     "staff-shifts": {"endpoint": "sync/export/staff", "endpoint_candidates": ["sync/export/staff", "staff-shifts", "staff", "attendance", "users"], "mode": "pos_admin", "collection": "pos_staff_shifts", "pos_resource": "staff-shifts", "label": "Staff Shifts"},
-    "reports": {"endpoint": "dashboard/stats", "mode": "pos_admin", "collection": "pos_reports_analytics", "pos_resource": "reports-analytics", "label": "Reports"},
+    "reports": {"endpoint": "sync/export/reports", "endpoint_candidates": ["sync/export/reports", "dashboard/stats"], "mode": "pos_admin", "collection": "pos_reports_analytics", "pos_resource": "reports-analytics", "label": "Reports"},
 }
 
 def pos_bridge_resource(resource: str) -> dict:
@@ -3589,7 +3589,6 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
     if POS_CORE_API_KEY:
         headers["Authorization"] = f"Bearer {POS_CORE_API_KEY}"
         headers["x-api-key"] = POS_CORE_API_KEY
-    login = await pos_login_for_admin_business(business_id)
     if business_id:
         headers.update(await pos_headers_for_admin_business(business_id))
     request_params = dict(params or {})
@@ -3601,7 +3600,6 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
 
     def do_request():
         session = requests.Session()
-        pos_core_login(session, headers, login.get("email"), login.get("password"))
         last_response = None
         for index, endpoint in enumerate(endpoint_candidates):
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
@@ -3653,7 +3651,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         })
         raise HTTPException(status_code=502, detail=detail) from exc
 
-async def pos_core_session_request(method: str, endpoint: str, json: dict | None = None, params: dict | None = None, extra_headers: Optional[dict] = None, login_email: Optional[str] = None, login_password: Optional[str] = None):
+async def pos_core_session_request(method: str, endpoint: str, json: dict | None = None, params: dict | None = None, extra_headers: Optional[dict] = None, login_email: Optional[str] = None, login_password: Optional[str] = None, use_login: bool = True):
     ensure_pos_bridge_config()
     headers = {}
     if POS_CORE_API_KEY:
@@ -3664,7 +3662,8 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
 
     def do_request():
         session = requests.Session()
-        pos_core_login(session, headers, login_email, login_password)
+        if use_login:
+            pos_core_login(session, headers, login_email, login_password)
         response = session.request(
             method,
             f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}",
@@ -3807,7 +3806,7 @@ async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
         "plan": business.get("plan") or "starter",
         "status": business.get("status") or "active",
     }
-    rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "businesses"))
+    rows = normalize_pos_bridge_rows(await pos_bridge_request("businesses"))
     existing = next(
         (
             row for row in rows
@@ -3821,12 +3820,12 @@ async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
         pos_business_id = existing_id
         tenant_id = existing.get("tenantId") or existing.get("tenant_id") or tenant_id
         try:
-            result = await pos_core_session_request("PUT", f"businesses/{existing_id}", json=payload)
+            result = await pos_core_session_request("POST", "admincore/tenants", json=payload, use_login=False)
         except HTTPException as exc:
             logger.warning("POS business exists but could not be updated; linking existing business: %s", exc.detail)
             result = {"linked_existing": True, "data": existing}
     else:
-        result = await pos_core_session_request("POST", "businesses", json=payload)
+        result = await pos_core_session_request("POST", "admincore/tenants", json=payload, use_login=False)
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         if isinstance(created, dict):
             pos_business_id = str(created.get("id") or created.get("business_id") or pos_business_id)
@@ -3878,7 +3877,7 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
             raise HTTPException(status_code=400, detail="Set a new password before syncing this user to POS")
         payload["password"] = secrets.token_urlsafe(10)
 
-    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers)
+    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers, use_login=False)
     created = result.get("data") if isinstance(result, dict) and "data" in result else result
     pos_user_id = created.get("id") if isinstance(created, dict) else None
     created_business_id = str((created or {}).get("business_id") or (created or {}).get("businessId") or "")
@@ -3908,9 +3907,10 @@ async def push_admin_product_to_pos(product_doc: dict):
     business_id = product_doc.get("business_id")
     if not POS_CORE_API_BASE_URL or not business_id:
         return None
-    login = await pos_login_for_admin_business(business_id)
     pos_headers = await pos_headers_for_admin_business(business_id)
-    product_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "products", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password")))
+    pos_business_id = pos_headers.get("business_id") or pos_headers.get("x-business-id") or business_id
+    pos_tenant_id = pos_headers.get("tenant_id") or pos_headers.get("x-tenant-id") or f"admincore-{business_id}"
+    product_rows = normalize_pos_bridge_rows(await pos_bridge_request("products", {}, business_id=business_id))
     existing = next(
         (
             row for row in product_rows
@@ -3925,27 +3925,30 @@ async def push_admin_product_to_pos(product_doc: dict):
         "stock": product_doc.get("stock") or 0,
         "category": product_doc.get("category") or "General",
         "active": product_doc.get("active", True),
+        "business_id": pos_business_id,
+        "businessId": pos_business_id,
+        "tenant_id": pos_tenant_id,
+        "tenantId": pos_tenant_id,
     }
     if existing:
-        result = await pos_core_session_request("PUT", f"products/{existing['id']}", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+        result = await pos_core_session_request("PUT", f"admincore/products/{existing['id']}", json=payload, extra_headers=pos_headers, use_login=False)
         pos_product_id = existing["id"]
     else:
-        result = await pos_core_session_request("POST", "products", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+        result = await pos_core_session_request("POST", "admincore/products", json=payload, extra_headers=pos_headers, use_login=False)
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_product_id = created.get("id") if isinstance(created, dict) else None
     if pos_product_id:
         await db.products.update_one(
             {"id": product_doc["id"]},
-            {"$set": {"pos_external_id": pos_product_id, "pos_synced": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
+            {"$set": {"pos_external_id": pos_product_id, "pos_business_id": pos_business_id, "pos_tenant_id": pos_tenant_id, "pos_synced": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
         )
     return result
 
 async def delete_admin_product_from_pos(product_doc: dict):
     if not POS_CORE_API_BASE_URL or not product_doc.get("business_id") or not product_doc.get("pos_external_id"):
         return None
-    login = await pos_login_for_admin_business(product_doc["business_id"])
     pos_headers = await pos_headers_for_admin_business(product_doc["business_id"])
-    return await pos_core_session_request("DELETE", f"products/{product_doc['pos_external_id']}", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+    return await pos_core_session_request("DELETE", f"admincore/products/{product_doc['pos_external_id']}", extra_headers=pos_headers, use_login=False)
 
 async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict] = None):
     business_id = outlet_doc.get("business_id")
