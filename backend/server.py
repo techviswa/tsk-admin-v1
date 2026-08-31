@@ -5060,10 +5060,8 @@ async def repair_missing_pos_default_outlets():
                 pos_tenant_id=business.get("pos_tenant_id") or f"admincore-{business['id']}",
             )
 
-@app.on_event("startup")
-async def startup():
+async def run_startup_maintenance():
     await repair_legacy_outlet_indexes()
-    await seed_data()
     await sync_system_modules()
     await repair_missing_pos_default_outlets()
     await db.users.create_index("email", unique=True)
@@ -5124,9 +5122,22 @@ async def startup():
         collection = db[config["collection"]]
         await collection.create_index("pos_external_id")
         await collection.create_index("pos_synced")
+    logger.info("Database indexes created")
+
+@app.on_event("startup")
+async def startup():
+    await seed_data()
+
+    async def maintenance_task():
+        try:
+            await run_startup_maintenance()
+        except Exception as exc:
+            logger.exception("Startup maintenance failed after API boot: %s", exc)
+
+    asyncio.create_task(maintenance_task())
     if POS_PROVISIONING_WORKER_ENABLED:
         asyncio.create_task(pos_provisioning_worker())
-    logger.info("Database indexes created")
+    logger.info("AdminCore API startup ready")
 
 
 # ===================================================================
