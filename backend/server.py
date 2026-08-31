@@ -1495,17 +1495,24 @@ async def provision_business_to_pos_endpoint(business_id: str, data: BusinessPro
         {"id": business_id},
         {"$set": {"pos_owner_email": owner_email, "pos_owner_password": owner_password, "updated_at": datetime.now(timezone.utc).isoformat()}},
     )
-    job = await queue_pos_provisioning_job(
-        business_id,
-        data.owner_name,
-        owner_email,
-        owner_password,
-        user,
-    )
-    asyncio.create_task(process_due_pos_provisioning_jobs(limit=1))
-    await create_audit_log(business_id, user["id"], user["email"], "provision_queued", "business", business_id, {"target": "pos", "job_id": job["id"]})
-    business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
-    return {"message": "POS provisioning queued", "job": job, "business": sanitize_business_doc(business)}
+    try:
+        result = await provision_business_end_to_end(
+            business_id,
+            owner_name=data.owner_name,
+            owner_email=owner_email,
+            owner_password=owner_password,
+            actor=user,
+            enqueue_on_failure=False,
+        )
+        await create_audit_log(business_id, user["id"], user["email"], "provision_synced", "business", business_id, {"target": "pos"})
+        business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
+        return {"message": "POS provisioning completed", "result": result, "business": sanitize_business_doc(business)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        detail = pos_error_detail(exc)
+        await mark_business_pos_status(business_id, "failed", detail)
+        raise HTTPException(status_code=502, detail=detail) from exc
 
 @business_router.get("/{business_id}")
 async def get_business(business_id: str, request: Request):
@@ -3828,7 +3835,7 @@ async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
         {"id": business_id},
         {"$set": {"pos_external_id": pos_business_id, "pos_tenant_id": tenant_id, "pos_synced": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
     )
-    await ensure_default_outlet_for_business(business_id, sync_to_pos=True, pos_business_id=pos_business_id, pos_tenant_id=tenant_id)
+    await ensure_default_outlet_for_business(business_id, sync_to_pos=False, pos_business_id=pos_business_id, pos_tenant_id=tenant_id)
     return {"business_id": pos_business_id, "tenant_id": tenant_id, "result": result}
 
 async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None, allow_generated_password: bool = False):
@@ -3838,7 +3845,6 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
     if not user_doc.get("email"):
         return None
     business_id = business_ids[0]
-    login = await pos_login_for_admin_business(business_id)
     pos_headers = await pos_headers_for_admin_business(business_id)
     business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
     outlet = await ensure_default_outlet_for_business(
@@ -3872,7 +3878,7 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
             raise HTTPException(status_code=400, detail="Set a new password before syncing this user to POS")
         payload["password"] = secrets.token_urlsafe(10)
 
-    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+    result = await pos_core_session_request("POST", "admincore/staff", json=payload, extra_headers=pos_headers)
     created = result.get("data") if isinstance(result, dict) and "data" in result else result
     pos_user_id = created.get("id") if isinstance(created, dict) else None
     created_business_id = str((created or {}).get("business_id") or (created or {}).get("businessId") or "")
