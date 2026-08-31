@@ -3703,29 +3703,6 @@ async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
         "x-tenant-id": provisioned["tenant_id"],
     }
 
-async def pos_login_for_admin_business(business_id: Optional[str]) -> dict:
-    if not business_id:
-        return {"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD}
-    business = await db.businesses.find_one(
-        {"id": business_id},
-        {"_id": 0, "pos_owner_email": 1, "pos_owner_password": 1},
-    )
-    if not business:
-        return {"email": POS_CORE_OWNER_EMAIL, "password": POS_CORE_OWNER_PASSWORD}
-    owner_email = business.get("pos_owner_email") or ""
-    owner_password = business.get("pos_owner_password") or ""
-    if owner_email and not owner_password:
-        raise HTTPException(status_code=409, detail={
-            "code": "POS_OWNER_PASSWORD_REQUIRED",
-            "message": "AdminCore needs the POS owner password for this business before it can sync POS data. Retry POS provisioning with the owner password.",
-            "business_id": business_id,
-            "pos_owner_email": owner_email,
-        })
-    return {
-        "email": owner_email or POS_CORE_OWNER_EMAIL,
-        "password": owner_password or POS_CORE_OWNER_PASSWORD,
-    }
-
 def admin_role_to_pos_role(role: str) -> str:
     if role == "business_owner":
         return "Owner"
@@ -3963,9 +3940,8 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
     business_id = outlet_doc.get("business_id")
     if not POS_CORE_API_BASE_URL or not business_id:
         return None
-    login = await pos_login_for_admin_business(business_id)
     pos_headers = pos_headers or await pos_headers_for_admin_business(business_id)
-    outlet_rows = normalize_pos_bridge_rows(await pos_core_session_request("GET", "outlets", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password")))
+    outlet_rows = normalize_pos_bridge_rows(await pos_bridge_request("outlets", {}, business_id=business_id))
     outlet_name = (outlet_doc.get("name") or "").strip().lower()
     outlet_code = (outlet_doc.get("code") or "").strip().lower()
     existing = next(
@@ -3991,10 +3967,10 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
         "tenant_id": outlet_doc.get("pos_tenant_id") or pos_headers.get("x-tenant-id") or "",
     }
     if existing:
-        result = await pos_core_session_request("PUT", f"outlets/{existing['id']}", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+        result = await pos_core_session_request("PUT", f"admincore/outlets/{existing['id']}", json=payload, extra_headers=pos_headers, use_login=False)
         pos_outlet_id = existing["id"]
     else:
-        result = await pos_core_session_request("POST", "outlets", json=payload, extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+        result = await pos_core_session_request("POST", "admincore/outlets", json=payload, extra_headers=pos_headers, use_login=False)
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_outlet_id = created.get("id") if isinstance(created, dict) else None
     if pos_outlet_id:
@@ -4013,9 +3989,8 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
 async def delete_admin_outlet_from_pos(outlet_doc: dict):
     if not POS_CORE_API_BASE_URL or not outlet_doc.get("business_id") or not outlet_doc.get("pos_external_id"):
         return None
-    login = await pos_login_for_admin_business(outlet_doc["business_id"])
     pos_headers = await pos_headers_for_admin_business(outlet_doc["business_id"])
-    return await pos_core_session_request("DELETE", f"outlets/{outlet_doc['pos_external_id']}", extra_headers=pos_headers, login_email=login.get("email"), login_password=login.get("password"))
+    return await pos_core_session_request("DELETE", f"admincore/outlets/{outlet_doc['pos_external_id']}", extra_headers=pos_headers, use_login=False)
 
 def external_id_for(row: dict) -> str:
     return str(row.get("id") or row.get("_id") or row.get("external_id") or row.get("code") or row.get("trackingToken") or ObjectId())
