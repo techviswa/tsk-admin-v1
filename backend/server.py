@@ -1723,11 +1723,14 @@ async def list_products(
                 await sync_bridge_product(row, business_id, now_ts)
         except HTTPException as exc:
             logger.warning("Could not auto-sync POS products for business %s: %s", business_id, exc.detail)
-            raise HTTPException(status_code=exc.status_code, detail={
-                "code": "POS_PRODUCTS_SYNC_FAILED",
-                "message": exc.detail,
-                "detail": "This business is linked to POS, but AdminCore could not load POS products.",
-            }) from exc
+            await db.businesses.update_one(
+                {"id": business_id},
+                {"$set": {
+                    "pos_last_sync_error": compact_bridge_error_detail(exc.detail),
+                    "pos_last_sync_error_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
     products = await db.products.find(query, {"_id": 0}).sort("name", 1).to_list(500)
     return products
 
@@ -1758,8 +1761,15 @@ async def create_product(data: ProductCreate, request: Request):
         pos_push = await push_admin_product_to_pos({k: v for k, v in doc.items() if k != "_id"})
     except HTTPException as exc:
         if POS_CORE_API_BASE_URL and doc.get("business_id"):
-            await db.products.delete_one({"id": doc["id"]})
-            raise HTTPException(status_code=502, detail=f"Product was not created because POS sync failed: {exc.detail}")
+            await db.products.update_one(
+                {"id": doc["id"]},
+                {"$set": {
+                    "pos_synced": False,
+                    "pos_sync_pending": True,
+                    "pos_sync_error": compact_bridge_error_detail(exc.detail),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
     await create_audit_log(doc.get("business_id"), user["id"], user["email"], "created", "product", doc["id"], {"name": doc["name"], "pos_pushed": bool(pos_push)})
     return await db.products.find_one({"id": doc["id"]}, {"_id": 0})
 
@@ -1797,7 +1807,16 @@ async def update_product(product_id: str, data: ProductUpdate, request: Request)
         pos_push = await push_admin_product_to_pos(product)
     except HTTPException as exc:
         if POS_CORE_API_BASE_URL and product.get("business_id"):
-            raise HTTPException(status_code=502, detail=f"Product was updated in AdminCore but POS sync failed: {exc.detail}")
+            await db.products.update_one(
+                {"id": product_id},
+                {"$set": {
+                    "pos_synced": False,
+                    "pos_sync_pending": True,
+                    "pos_sync_error": compact_bridge_error_detail(exc.detail),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+            product = await db.products.find_one({"id": product_id}, {"_id": 0})
     await create_audit_log(product.get("business_id"), user["id"], user["email"], "updated", "product", product_id, {**update_data, "pos_pushed": bool(pos_push)})
     return product
 
@@ -1815,7 +1834,19 @@ async def delete_product(product_id: str, request: Request):
         await delete_admin_product_from_pos(product)
     except HTTPException as exc:
         if POS_CORE_API_BASE_URL and product.get("business_id"):
-            raise HTTPException(status_code=502, detail=f"Product was not deleted because POS sync failed: {exc.detail}")
+            await db.products.update_one(
+                {"id": product_id},
+                {"$set": {
+                    "status": "inactive",
+                    "active": False,
+                    "pos_delete_pending": True,
+                    "pos_sync_pending": True,
+                    "pos_sync_error": compact_bridge_error_detail(exc.detail),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+            await create_audit_log(product.get("business_id"), user["id"], user["email"], "delete_pending", "product", product_id, {"pos_sync_error": compact_bridge_error_detail(exc.detail)})
+            return {"message": "Product marked inactive; POS delete will retry when sync is available", "delete_pending": True}
     await db.products.delete_one({"id": product_id})
     await create_audit_log(product.get("business_id"), user["id"], user["email"], "deleted", "product", product_id)
     return {"message": "Product deleted"}
@@ -2860,11 +2891,15 @@ async def list_pos_admin_records(
         try:
             await sync_pos_bridge_resource_for_system(bridge_resource, business_id, user)
         except HTTPException as exc:
-            raise HTTPException(status_code=exc.status_code, detail={
-                "code": f"POS_{resource.upper().replace('-', '_')}_SYNC_FAILED",
-                "message": exc.detail,
-                "detail": f"This business is linked to POS, but AdminCore could not load POS {config['label']}.",
-            }) from exc
+            logger.warning("Could not auto-sync POS %s for business %s: %s", resource, business_id, exc.detail)
+            await db.businesses.update_one(
+                {"id": business_id},
+                {"$set": {
+                    "pos_last_sync_error": compact_bridge_error_detail(exc.detail),
+                    "pos_last_sync_error_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
     records = await collection.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
     total = await collection.count_documents(query)
     status_counts = []
