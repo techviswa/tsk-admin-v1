@@ -57,6 +57,15 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI(title="AdminCore API", version="1.0.0")
 api_router = APIRouter(prefix="/api")
 
+@api_router.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "admincore",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "pos_configured": bool(POS_CORE_API_BASE_URL),
+    }
+
 # ===== LOGGING =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -5046,7 +5055,7 @@ async def repair_missing_pos_default_outlets():
         if not has_outlet:
             await ensure_default_outlet_for_business(
                 business["id"],
-                sync_to_pos=bool(POS_CORE_API_BASE_URL),
+                sync_to_pos=False,
                 pos_business_id=business.get("pos_external_id") or business["id"],
                 pos_tenant_id=business.get("pos_tenant_id") or f"admincore-{business['id']}",
             )
