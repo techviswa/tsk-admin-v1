@@ -669,6 +669,8 @@ POS_RESOURCE_MODULES = {
     "import-export": "import_export",
     "integrations-webhooks": "integrations",
     "audit-security": "audit_security",
+    "qr-ordering": "tables",
+    "central-kitchen": "inventory",
 }
 
 CORE_FEATURE_MODULES = {
@@ -2787,6 +2789,8 @@ POS_ADMIN_RESOURCES = {
     "import-export": {"priority": 18, "collection": "pos_import_export", "label": "Import / Export", "statuses": ["queued", "processing", "completed", "failed"]},
     "integrations-webhooks": {"priority": 19, "collection": "pos_integrations_webhooks", "label": "Webhooks / Integrations", "statuses": ["connected", "failing", "disabled", "pending"]},
     "audit-security": {"priority": 20, "collection": "pos_audit_security", "label": "Audit & Security", "statuses": ["open", "reviewed", "resolved", "ignored"]},
+    "qr-ordering": {"priority": 21, "collection": "pos_qr_ordering", "label": "QR Ordering", "statuses": ["active", "inactive", "completed", "closed"]},
+    "central-kitchen": {"priority": 22, "collection": "pos_central_kitchen", "label": "Central Kitchen", "statuses": ["draft", "requested", "ordered", "received", "allocated", "dispatched", "completed", "cancelled"]},
 }
 
 def pos_resource_config(resource: str) -> dict:
@@ -3341,6 +3345,18 @@ POS_BRIDGE_RESOURCES = {
     "inventory": {"endpoint": "sync/export/inventory", "endpoint_candidates": ["sync/export/inventory", "inventory"], "mode": "pos_admin", "collection": "pos_inventory_admin", "pos_resource": "inventory", "label": "Inventory"},
     "staff-shifts": {"endpoint": "sync/export/staff", "endpoint_candidates": ["sync/export/staff", "staff-shifts", "staff", "attendance", "users"], "mode": "pos_admin", "collection": "pos_staff_shifts", "pos_resource": "staff-shifts", "label": "Staff Shifts"},
     "reports": {"endpoint": "sync/export/reports", "endpoint_candidates": ["sync/export/reports", "dashboard/stats"], "mode": "pos_admin", "collection": "pos_reports_analytics", "pos_resource": "reports-analytics", "label": "Reports"},
+    "qr-ordering": {"endpoint": "sync/export/qr", "endpoint_candidates": ["sync/export/qr"], "mode": "pos_admin", "collection": "pos_qr_ordering", "pos_resource": "qr-ordering", "label": "QR Ordering"},
+    "central-kitchen": {"endpoint": "sync/export/central-kitchen", "endpoint_candidates": ["sync/export/central-kitchen"], "mode": "pos_admin", "collection": "pos_central_kitchen", "pos_resource": "central-kitchen", "label": "Central Kitchen"},
+    "taxes-charges": {"endpoint": "sync/export/taxes", "endpoint_candidates": ["sync/export/taxes"], "mode": "pos_admin", "collection": "pos_taxes_charges", "pos_resource": "taxes-charges", "label": "Taxes & Charges"},
+    "discounts-coupons": {"endpoint": "sync/export/discounts", "endpoint_candidates": ["sync/export/discounts"], "mode": "pos_admin", "collection": "pos_discounts_coupons", "pos_resource": "discounts-coupons", "label": "Discounts / Coupons"},
+    "suppliers-purchasing": {"endpoint": "sync/export/suppliers", "endpoint_candidates": ["sync/export/suppliers"], "mode": "pos_admin", "collection": "pos_suppliers_purchasing", "pos_resource": "suppliers-purchasing", "label": "Suppliers / Purchasing"},
+    "expenses": {"endpoint": "sync/export/expenses", "endpoint_candidates": ["sync/export/expenses"], "mode": "pos_admin", "collection": "pos_expenses", "pos_resource": "expenses", "label": "Expenses"},
+    "hardware-printers": {"endpoint": "sync/export/hardware", "endpoint_candidates": ["sync/export/hardware"], "mode": "pos_admin", "collection": "pos_hardware_printers", "pos_resource": "hardware-printers", "label": "Hardware / Printers"},
+    "role-permissions": {"endpoint": "sync/export/permissions", "endpoint_candidates": ["sync/export/permissions"], "mode": "pos_admin", "collection": "pos_role_permissions", "pos_resource": "role-permissions", "label": "Role Permissions"},
+    "notifications": {"endpoint": "sync/export/notifications", "endpoint_candidates": ["sync/export/notifications"], "mode": "pos_admin", "collection": "pos_notifications", "pos_resource": "notifications", "label": "Notifications"},
+    "import-export": {"endpoint": "sync/export/import-export", "endpoint_candidates": ["sync/export/import-export"], "mode": "pos_admin", "collection": "pos_import_export", "pos_resource": "import-export", "label": "Import / Export"},
+    "integrations-webhooks": {"endpoint": "sync/export/webhooks", "endpoint_candidates": ["sync/export/webhooks"], "mode": "pos_admin", "collection": "pos_integrations_webhooks", "pos_resource": "integrations-webhooks", "label": "Integrations / Webhooks"},
+    "audit-security": {"endpoint": "sync/export/audit-security", "endpoint_candidates": ["sync/export/audit-security"], "mode": "pos_admin", "collection": "pos_audit_security", "pos_resource": "audit-security", "label": "Audit & Security"},
 }
 
 def pos_bridge_resource(resource: str) -> dict:
@@ -3356,7 +3372,7 @@ def ensure_pos_bridge_config():
 def normalize_pos_bridge_rows(payload):
     data = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
     if isinstance(data, dict):
-        for key in ["records", "items", "results", "rows", "businesses", "outlets", "products", "orders", "bills", "payments", "tables", "qr_codes", "tickets", "kots", "inventory", "customers", "reservations", "staff", "shifts"]:
+        for key in ["records", "items", "results", "rows", "businesses", "outlets", "products", "orders", "bills", "payments", "tables", "qr_codes", "central_kitchen", "taxes", "discounts", "suppliers", "expenses", "hardware", "permissions", "notifications", "webhooks", "audit_security", "settings", "tickets", "kots", "inventory", "customers", "reservations", "staff", "shifts"]:
             if isinstance(data.get(key), list):
                 return data[key]
         return [data]
@@ -5197,3 +5213,4 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
