@@ -1449,7 +1449,6 @@ async def create_business(data: BusinessCreate, request: Request):
             owner_password=owner_password,
             actor=user,
         )
-        asyncio.create_task(process_due_pos_provisioning_jobs(limit=1))
     created_qr_code = None
     if qr_setup_mode == "local":
         outlet_doc = created_outlet or await ensure_default_outlet_for_business(biz_id, user=user, sync_to_pos=bool(POS_CORE_API_BASE_URL))
