@@ -29,7 +29,7 @@ export const ROUTE_MODULES = {
   '/feature-flags': 'feature_flags',
   '/audit-logs': 'audit_security',
   '/integrations': 'integrations',
-  '/pos-bridge': 'integrations',
+  '/pos-bridge': 'pos_bridge',
   '/subscriptions': 'subscriptions',
 };
 

@@ -727,6 +727,7 @@ CORE_FEATURE_MODULES = {
     "feature_flags": "feature_flags",
     "audit_logs": "audit_security",
     "integrations": "integrations",
+    "pos_bridge": "pos_bridge",
     "subscriptions": "subscriptions",
     "qr_codes": "qr_codes",
 }
@@ -2863,6 +2864,9 @@ async def pos_business_filter(user: dict, business_id: Optional[str]) -> dict:
 async def validate_pos_admin_business(user: dict, business_id: Optional[str]):
     await validate_business_access(user, business_id)
 
+async def require_pos_bridge_access(user: dict, business_id: Optional[str]):
+    await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["pos_bridge"])
+
 async def decorate_pos_records(records: list[dict]) -> list[dict]:
     business_ids = list({row.get("business_id") for row in records if row.get("business_id")})
     businesses = {}
@@ -4493,7 +4497,7 @@ async def get_pos_bridge_config(request: Request):
 async def list_pos_bridge_resources(request: Request, business_id: Optional[str] = Query(None)):
     user = await get_current_user(request)
     await validate_pos_admin_business(user, business_id)
-    await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
+    await require_pos_bridge_access(user, business_id)
     rows = []
     for key, config in POS_BRIDGE_RESOURCES.items():
         count_query = {}
@@ -4532,7 +4536,7 @@ async def proxy_pos_bridge_resource(resource: str, request: Request, business_id
     if not business_id and user.get("role") != "platform_admin":
         raise HTTPException(status_code=400, detail="business_id is required for POS bridge live data")
     await validate_pos_admin_business(user, business_id)
-    await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
+    await require_pos_bridge_access(user, business_id)
     params = {}
     payload = await pos_bridge_request(resource, params, business_id=business_id)
     rows = await validate_pos_rows_for_business(resource, await prepare_pos_bridge_rows(resource, payload, business_id), business_id)
@@ -4544,7 +4548,7 @@ async def sync_pos_bridge_resource(resource: str, request: Request, business_id:
     if not business_id and user.get("role") != "platform_admin":
         raise HTTPException(status_code=400, detail="business_id is required for POS bridge sync")
     await validate_pos_admin_business(user, business_id)
-    await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
+    await require_pos_bridge_access(user, business_id)
     config = pos_bridge_resource(resource)
     now_ts = datetime.now(timezone.utc).isoformat()
     local_business_id = business_id
@@ -4710,7 +4714,7 @@ async def sync_all_pos_bridge_resources(request: Request, business_id: Optional[
     if not business_id and user.get("role") != "platform_admin":
         raise HTTPException(status_code=400, detail="business_id is required for POS bridge sync")
     await validate_pos_admin_business(user, business_id)
-    await require_module_for_business_scope(user, business_id, CORE_FEATURE_MODULES["integrations"])
+    await require_pos_bridge_access(user, business_id)
 
     async def sync_one(resource: str):
         try:
@@ -4780,6 +4784,7 @@ SYSTEM_MODULES = [
     {"slug": "notifications", "name": "Notifications", "description": "Email, SMS, push, alert rules, delivery logs, and templates.", "icon": "Bell", "category": "saas", "is_core": False, "sort_order": 80},
     {"slug": "import_export", "name": "Import & Export", "description": "CSV/PDF exports, bulk imports, backups, and data portability.", "icon": "FileUp", "category": "saas", "is_core": False, "sort_order": 90},
     {"slug": "integrations", "name": "Integrations & Webhooks", "description": "External apps, API keys, webhooks, bridge health, and sync configuration.", "icon": "Plug", "category": "saas", "is_core": False, "sort_order": 100},
+    {"slug": "pos_bridge", "name": "POS Bridge", "description": "Core POS connection, tenant provisioning, scoped import, and sync health.", "icon": "RefreshCw", "category": "saas", "is_core": True, "sort_order": 105},
     {"slug": "pos", "name": "POS Orders & Sales", "description": "Create orders, track sales, order items, statuses, receipts, and invoices.", "icon": "ShoppingCart", "category": "pos", "is_core": True, "sort_order": 110},
     {"slug": "payments", "name": "Payments", "description": "Cash, card, UPI/manual payments, payment status, refunds, and method reports.", "icon": "CreditCard", "category": "pos", "is_core": True, "sort_order": 120},
     {"slug": "billing", "name": "Billing & Invoicing", "description": "Bills, invoices, subscription charges, payment history, and renewal records.", "icon": "Receipt", "category": "finance", "is_core": True, "sort_order": 130},
