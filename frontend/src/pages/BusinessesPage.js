@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useBusiness } from '@/components/layout/DashboardLayout';
-import api, { formatApiError } from '@/lib/api';
+import api, { formatApiDetail, formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -69,8 +69,12 @@ export default function BusinessesPage() {
         await api.put(`/businesses/${editing.id}`, { name: form.name, type: form.type, plan: form.plan });
         toast.success('Business updated');
       } else {
-        await api.post('/businesses', form);
-        toast.success('Business created; POS provisioning queued');
+        const { data } = await api.post('/businesses', form);
+        if (data.pos_provisioning_status === 'synced' || data.pos_provisioned) {
+          toast.success('Business created and POS provisioning completed');
+        } else {
+          toast.warning('Business saved in AdminCore. POS provisioning is queued and not ready yet.');
+        }
       }
       setSheetOpen(false);
       fetchBusinesses();
@@ -118,7 +122,7 @@ export default function BusinessesPage() {
     setRetryingId(retryBusiness.id);
     try {
       await api.post(`/businesses/${retryBusiness.id}/provision-pos`, retryForm);
-      toast.success('POS provisioning retry queued');
+      toast.success('POS provisioning completed');
       setRetryBusiness(null);
       fetchBusinesses();
       refreshBusinesses();
@@ -176,7 +180,11 @@ export default function BusinessesPage() {
                     <Badge className={`text-[11px] ${posStatusColor(biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not_configured'))}`}>
                       {biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not configured')}
                     </Badge>
-                    {biz.pos_provisioning_error && <p className="max-w-[220px] truncate text-[11px] text-red-600" title={biz.pos_provisioning_error}>{biz.pos_provisioning_error}</p>}
+                    {biz.pos_provisioning_error && (
+                      <p className="max-w-[220px] truncate text-[11px] text-red-600" title={formatApiDetail(biz.pos_provisioning_error_detail || biz.pos_provisioning_error)}>
+                        {formatApiDetail(biz.pos_provisioning_error)}
+                      </p>
+                    )}
                   </div>
                 </TableCell>
                 <TableCell className="text-zinc-500 text-xs py-3">{new Date(biz.created_at).toLocaleDateString()}</TableCell>

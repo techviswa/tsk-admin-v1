@@ -119,6 +119,10 @@ function formatDetailValue(value) {
   }
 }
 
+export function formatApiDetail(value) {
+  return shorten(formatDetailValue(value));
+}
+
 // Format API error detail for display
 export function formatApiError(err) {
   if (err?.code === 'ECONNABORTED') {

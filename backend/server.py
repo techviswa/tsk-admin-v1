@@ -253,7 +253,12 @@ async def mark_business_pos_status(business_id: str, status: str, error=None, ex
     if status == "synced":
         update.update({"pos_synced": True, "pos_provisioning_error": ""})
     elif error is not None:
-        update.update({"pos_synced": False, "pos_provisioning_error": str(error)})
+        detail = compact_bridge_error_detail(error) if isinstance(error, dict) else error
+        update.update({
+            "pos_synced": False,
+            "pos_provisioning_error": bridge_error_message(detail),
+            "pos_provisioning_error_detail": detail,
+        })
     if extra:
         update.update(extra)
     await db.businesses.update_one({"id": business_id}, {"$set": update})
