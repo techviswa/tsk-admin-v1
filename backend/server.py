@@ -38,10 +38,13 @@ POS_CORE_OWNER_PASSWORD = os.environ.get("POS_CORE_OWNER_PASSWORD", "")
 ADMINCORE_API_KEY = os.environ.get("ADMINCORE_API_KEY", "")
 POS_CORE_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("POS_CORE_REQUEST_TIMEOUT_SECONDS", "20"))
 POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS = int(os.environ.get("POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS", "45"))
+POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.environ.get("POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS", "300"))
 POS_PROVISIONING_MAX_ATTEMPTS = int(os.environ.get("POS_PROVISIONING_MAX_ATTEMPTS", "6"))
 POS_PROVISIONING_WORKER_ENABLED = os.environ.get("POS_PROVISIONING_WORKER_ENABLED", "true").lower() != "false"
 POS_PROVISIONING_WORKER_INTERVAL_SECONDS = int(os.environ.get("POS_PROVISIONING_WORKER_INTERVAL_SECONDS", "30"))
+POS_PROVISIONING_INITIAL_DELAY_SECONDS = int(os.environ.get("POS_PROVISIONING_INITIAL_DELAY_SECONDS", "20"))
 POS_PROVISIONING_RETRY_DELAYS_SECONDS = [30, 60, 180, 300, 600, 900]
+POS_CORE_RATE_LIMIT_UNTIL = 0.0
 
 # ===== DATABASE =====
 mongo_url = os.environ['MONGO_URL']
@@ -180,7 +183,33 @@ def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
             detail["response"] = summarize_response_text(response.text)
     return detail
 
+def pos_rate_limit_seconds_remaining() -> int:
+    return max(0, int(POS_CORE_RATE_LIMIT_UNTIL - time.time()))
+
+def mark_pos_rate_limited(response=None) -> int:
+    global POS_CORE_RATE_LIMIT_UNTIL
+    retry_after = None
+    if response is not None:
+        try:
+            retry_after = int(response.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            retry_after = None
+    cooldown = max(retry_after or 0, POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS)
+    POS_CORE_RATE_LIMIT_UNTIL = max(POS_CORE_RATE_LIMIT_UNTIL, time.time() + cooldown)
+    return cooldown
+
+def raise_if_pos_rate_limited(resource: str):
+    remaining = pos_rate_limit_seconds_remaining()
+    if remaining > 0:
+        raise HTTPException(status_code=429, detail={
+            "code": "POS_RATE_LIMITED",
+            "resource": resource,
+            "retry_after_seconds": remaining,
+            "message": f"POS is rate limiting bridge requests. AdminCore paused POS sync for {remaining} seconds to avoid making it worse.",
+        })
+
 def pos_core_login(session: requests.Session, headers: dict, email: Optional[str] = None, password: Optional[str] = None):
+    raise_if_pos_rate_limited("auth/login")
     login_email = (email or POS_CORE_OWNER_EMAIL or "").strip().lower()
     login_password = password or POS_CORE_OWNER_PASSWORD
     if not login_email or not login_password:
@@ -195,8 +224,18 @@ def pos_core_login(session: requests.Session, headers: dict, email: Optional[str
                 headers=headers,
                 timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS,
             )
+            if response.status_code == 429:
+                cooldown = mark_pos_rate_limited(response)
+                raise HTTPException(status_code=429, detail={
+                    "code": "POS_RATE_LIMITED",
+                    "resource": "auth/login",
+                    "retry_after_seconds": cooldown,
+                    "message": f"POS login is rate limited. AdminCore paused POS calls for {cooldown} seconds.",
+                })
             response.raise_for_status()
             return
+        except HTTPException:
+            raise
         except requests.RequestException as exc:
             last_exc = exc
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -294,7 +333,7 @@ async def queue_pos_provisioning_job(
         "attempts": 0,
         "max_attempts": POS_PROVISIONING_MAX_ATTEMPTS,
         "last_error": "",
-        "run_after": run_after or now_ts,
+        "run_after": run_after or (datetime.now(timezone.utc) + timedelta(seconds=POS_PROVISIONING_INITIAL_DELAY_SECONDS)).isoformat(),
         "created_at": now_ts,
         "updated_at": now_ts,
     }
@@ -353,7 +392,9 @@ async def run_pos_provisioning_job(job: dict):
         await db.pos_provisioning_jobs.update_one({"id": job["id"]}, {"$set": update})
         await mark_business_pos_status(business_id, "failed" if status == "failed" else "pending", detail)
 
-async def process_due_pos_provisioning_jobs(limit: int = 3):
+async def process_due_pos_provisioning_jobs(limit: int = 1):
+    if pos_rate_limit_seconds_remaining() > 0:
+        return
     now_ts = datetime.now(timezone.utc).isoformat()
     stale_running_before = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
     await db.pos_provisioning_jobs.update_many(
@@ -3642,6 +3683,7 @@ async def cleanup_mismatched_pos_imports(resource: str, business_id: Optional[st
 
 async def pos_bridge_request(resource: str, params: dict | None = None, business_id: Optional[str] = None):
     ensure_pos_bridge_config()
+    raise_if_pos_rate_limited(resource)
     config = pos_bridge_resource(resource)
     endpoint_candidates = config.get("endpoint_candidates") or [config["endpoint"]]
     headers = {}
@@ -3664,6 +3706,15 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
             response = session.get(url, params=request_params, headers=headers, timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS)
             last_response = response
+            if response.status_code == 429:
+                cooldown = mark_pos_rate_limited(response)
+                raise HTTPException(status_code=429, detail={
+                    "code": "POS_RATE_LIMITED",
+                    "resource": resource,
+                    "endpoint": endpoint,
+                    "retry_after_seconds": cooldown,
+                    "message": f"POS returned 429 Too Many Requests. AdminCore paused POS sync for {cooldown} seconds.",
+                })
             if response.status_code == 404 and index < len(endpoint_candidates) - 1:
                 continue
             if resource == "businesses" and response.status_code == 404:
@@ -3700,6 +3751,8 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         payload = await run_in_threadpool(do_request)
         await validate_pos_rows_for_business(resource, await prepare_pos_bridge_rows(resource, payload, business_id), business_id)
         return payload
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
         detail = requests_error_detail(exc, f"POS bridge request for {resource}")
         detail.update({
@@ -3708,10 +3761,14 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
             "endpoint": config.get("endpoint"),
             "tried": endpoint_candidates,
         })
+        if detail.get("status_code") == 429:
+            cooldown = mark_pos_rate_limited(getattr(exc, "response", None))
+            raise HTTPException(status_code=429, detail={**detail, "code": "POS_RATE_LIMITED", "retry_after_seconds": cooldown}) from exc
         raise HTTPException(status_code=502, detail=detail) from exc
 
 async def pos_core_session_request(method: str, endpoint: str, json: dict | None = None, params: dict | None = None, extra_headers: Optional[dict] = None, login_email: Optional[str] = None, login_password: Optional[str] = None, use_login: bool = True):
     ensure_pos_bridge_config()
+    raise_if_pos_rate_limited(endpoint)
     headers = {}
     if POS_CORE_API_KEY:
         headers["Authorization"] = f"Bearer {POS_CORE_API_KEY}"
@@ -3731,13 +3788,27 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
             headers=headers,
             timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS,
         )
+        if response.status_code == 429:
+            cooldown = mark_pos_rate_limited(response)
+            raise HTTPException(status_code=429, detail={
+                "code": "POS_RATE_LIMITED",
+                "resource": endpoint,
+                "retry_after_seconds": cooldown,
+                "message": f"POS returned 429 Too Many Requests. AdminCore paused POS calls for {cooldown} seconds.",
+            })
         response.raise_for_status()
         return response.json()
 
     try:
         return await run_in_threadpool(do_request)
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=requests_error_detail(exc, f"POS core request for {endpoint}")) from exc
+        detail = requests_error_detail(exc, f"POS core request for {endpoint}")
+        if detail.get("status_code") == 429:
+            cooldown = mark_pos_rate_limited(getattr(exc, "response", None))
+            raise HTTPException(status_code=429, detail={**detail, "code": "POS_RATE_LIMITED", "retry_after_seconds": cooldown}) from exc
+        raise HTTPException(status_code=502, detail=detail) from exc
 
 async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
     if not business_id:
