@@ -22,7 +22,7 @@ const SYNC_STATUS_CLASSES = {
   failed: 'bg-red-50 text-red-700 border-red-200',
 };
 
-const POS_BRIDGE_TIMEOUT_MS = 60000;
+const POS_BRIDGE_TIMEOUT_MS = 25000;
 
 function formatSyncTime(value) {
   if (!value) return '-';
@@ -38,6 +38,12 @@ function errorText(error) {
   if (error.message) return error.message;
   if (error.detail) return typeof error.detail === 'object' ? JSON.stringify(error.detail) : String(error.detail);
   return JSON.stringify(error);
+}
+
+function shouldStopSyncAll(err) {
+  const status = err?.response?.status;
+  const code = err?.response?.data?.detail?.code;
+  return status === 401 || status === 403 || status === 429 || status >= 500 || err?.code === 'ECONNABORTED' || code === 'POS_RATE_LIMITED';
 }
 
 export default function POSBridgePage() {
@@ -96,17 +102,24 @@ export default function POSBridgePage() {
           const { data } = await api.post(`/pos-bridge/sync/${resource.key}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
           results[resource.key] = data;
         } catch (err) {
+          const reason = formatApiError(err);
           results[resource.key] = {
             resource: resource.key,
             status: 'failed',
             count: 0,
             error_count: 1,
-            errors: [{ reason: formatApiError(err) }],
+            errors: [{ reason }],
           };
+          setLastResult({ results: { ...results } });
+          if (shouldStopSyncAll(err)) {
+            toast.error(reason);
+            break;
+          }
         }
         setLastResult({ results: { ...results } });
       }
-      toast.success('POS bridge sync completed');
+      const failed = Object.values(results).some(result => result?.status === 'failed' || result?.error_count > 0);
+      toast[failed ? 'error' : 'success'](failed ? 'POS bridge sync stopped with errors' : 'POS bridge sync completed');
       await load();
     } catch (err) {
       toast.error(formatApiError(err));
