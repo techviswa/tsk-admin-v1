@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 from pathlib import Path
+from pos_passwords import hash_pos_password
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -27,6 +28,7 @@ from pymongo.errors import PyMongoError
 import bcrypt
 import jwt as pyjwt
 import qrcode
+from pos_sync_worker import PosSyncWorker
 
 # ===== CONFIGURATION =====
 JWT_ALGORITHM = "HS256"
@@ -331,7 +333,7 @@ async def queue_pos_provisioning_job(
         "business_id": business_id,
         "owner_name": owner_name or "",
         "owner_email": (owner_email or "").strip().lower(),
-        "owner_password": owner_password or "",
+        "owner_password": hash_pos_password(owner_password),
         "actor_id": (actor or {}).get("id", "system"),
         "actor_email": (actor or {}).get("email", "system"),
         "status": "pending",
@@ -364,10 +366,12 @@ async def run_pos_provisioning_job(job: dict):
         "id": job.get("actor_id") or "system",
         "email": job.get("actor_email") or "system",
     }
-    await db.pos_provisioning_jobs.update_one(
-        {"id": job["id"]},
+    claim = await db.pos_provisioning_jobs.update_one(
+        {"id": job["id"], "status": {"$in": ["pending", "retrying"]}, "attempts": attempts - 1},
         {"$set": {"status": "running", "attempts": attempts, "last_attempt_at": now_ts, "updated_at": now_ts}},
     )
+    if not claim.modified_count:
+        return
     try:
         result = await provision_business_end_to_end(
             business_id,
@@ -445,8 +449,10 @@ async def ensure_business_owner_user(
         return existing
     if not owner_password:
         raise HTTPException(status_code=400, detail="Owner password is required to create the business owner login")
-    if len(owner_password) < 6:
-        raise HTTPException(status_code=400, detail="Owner password must be at least 6 characters")
+    if owner_password.startswith("pbkdf2$"):
+        raise HTTPException(status_code=400, detail="Create the AdminCore owner before retrying POS provisioning")
+    if len(owner_password) < 8:
+        raise HTTPException(status_code=400, detail="Owner password must be at least 8 characters")
     doc = {
         "id": str(ObjectId()),
         "email": email,
@@ -484,7 +490,7 @@ async def provision_business_end_to_end(
         )
         if not owner:
             raise HTTPException(status_code=400, detail="Business owner email and password are required before POS provisioning can complete")
-        await push_admin_user_to_pos(owner, owner_password, allow_generated_password=False)
+        await push_admin_user_to_pos(owner, owner_password, allow_generated_password=False, target_business_id=business_id)
         outlet = await ensure_default_outlet_for_business(
             business_id,
             user=actor,
@@ -1443,8 +1449,8 @@ async def create_business(data: BusinessCreate, request: Request):
     if POS_CORE_API_BASE_URL:
         if not owner_email:
             raise HTTPException(status_code=400, detail="Owner email is required so the business can login to POS")
-        if not owner_password or len(owner_password) < 6:
-            raise HTTPException(status_code=400, detail="Owner password must be at least 6 characters")
+        if not owner_password or len(owner_password) < 8:
+            raise HTTPException(status_code=400, detail="Owner password must be at least 8 characters")
     qr_setup_mode = (data.qr_setup_mode or "none").lower()
     if qr_setup_mode not in ["none", "link", "local"]:
         raise HTTPException(status_code=400, detail="qr_setup_mode must be none, link, or local")
@@ -1472,7 +1478,6 @@ async def create_business(data: BusinessCreate, request: Request):
         "pos_provisioning_status": "pending" if POS_CORE_API_BASE_URL else "not_configured",
         "pos_provisioning_error": "",
         "pos_owner_email": owner_email,
-        "pos_owner_password": owner_password if POS_CORE_API_BASE_URL else "",
         "created_at": now_ts,
         "updated_at": now_ts,
     }
@@ -1529,8 +1534,10 @@ async def create_business(data: BusinessCreate, request: Request):
         "pos_provisioning_job": pos_job,
     }
 
-@business_router.post("/{business_id}/provision-pos")
+@business_router.post("/{business_id}/provision-pos", status_code=202)
 async def provision_business_to_pos_endpoint(business_id: str, data: BusinessProvisionRequest, request: Request):
+    if not POS_CORE_API_BASE_URL:
+        raise HTTPException(status_code=503, detail="POS bridge is not configured")
     user = await get_current_user(request)
     if user["role"] not in ["platform_admin", "business_owner"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -1540,8 +1547,8 @@ async def provision_business_to_pos_endpoint(business_id: str, data: BusinessPro
     if POS_CORE_API_BASE_URL:
         if not owner_email:
             raise HTTPException(status_code=400, detail="Owner email is required so the business can login to POS")
-        if not owner_password or len(owner_password) < 6:
-            raise HTTPException(status_code=400, detail="Owner password must be at least 6 characters")
+        if not owner_password or len(owner_password) < 8:
+            raise HTTPException(status_code=400, detail="Owner password must be at least 8 characters")
     await ensure_business_owner_user(
         business_id,
         data.owner_name,
@@ -1550,26 +1557,18 @@ async def provision_business_to_pos_endpoint(business_id: str, data: BusinessPro
     )
     await db.businesses.update_one(
         {"id": business_id},
-        {"$set": {"pos_owner_email": owner_email, "pos_owner_password": owner_password, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        {"$set": {"pos_owner_email": owner_email, "updated_at": datetime.now(timezone.utc).isoformat()}, "$unset": {"pos_owner_password": ""}},
     )
-    try:
-        result = await provision_business_end_to_end(
-            business_id,
-            owner_name=data.owner_name,
-            owner_email=owner_email,
-            owner_password=owner_password,
-            actor=user,
-            enqueue_on_failure=False,
-        )
-        await create_audit_log(business_id, user["id"], user["email"], "provision_synced", "business", business_id, {"target": "pos"})
-        business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
-        return {"message": "POS provisioning completed", "result": result, "business": sanitize_business_doc(business)}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        detail = pos_error_detail(exc)
-        await mark_business_pos_status(business_id, "failed", detail)
-        raise HTTPException(status_code=502, detail=detail) from exc
+    job = await queue_pos_provisioning_job(
+        business_id,
+        owner_name=data.owner_name,
+        owner_email=owner_email,
+        owner_password=owner_password,
+        actor=user,
+    )
+    business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
+    return {"message": "POS provisioning queued", "pos_provisioned": False,
+            "pos_provisioning_job": job, "business": sanitize_business_doc(business)}
 
 @business_router.get("/{business_id}")
 async def get_business(business_id: str, request: Request):
@@ -3889,6 +3888,7 @@ async def ensure_default_outlet_for_business(
                 existing = await db.outlets.find_one({"id": existing["id"]}, {"_id": 0})
             except HTTPException as exc:
                 logger.warning("Could not sync existing default outlet to POS: %s", exc.detail)
+                raise
         return existing
 
     outlet_doc = {
@@ -3915,6 +3915,7 @@ async def ensure_default_outlet_for_business(
             outlet_doc = await db.outlets.find_one({"id": outlet_doc["id"]}, {"_id": 0})
         except HTTPException as exc:
             logger.warning("Could not sync default outlet to POS: %s", exc.detail)
+            raise
     return {k: v for k, v in outlet_doc.items() if k != "_id"}
 
 async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
@@ -3935,30 +3936,15 @@ async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
         "plan": business.get("plan") or "starter",
         "status": business.get("status") or "active",
     }
-    rows = normalize_pos_bridge_rows(await pos_bridge_request("businesses"))
-    existing = next(
-        (
-            row for row in rows
-            if str(row.get("id") or row.get("business_id") or row.get("pos_business_id") or "") == str(pos_business_id)
-            or (row.get("name") or "").strip().lower() == (payload["name"] or "").strip().lower()
-        ),
-        None,
-    )
-    if existing:
-        existing_id = str(existing.get("id") or existing.get("business_id") or pos_business_id)
-        pos_business_id = existing_id
-        tenant_id = existing.get("tenantId") or existing.get("tenant_id") or tenant_id
-        try:
-            result = await pos_core_session_request("POST", "admincore/tenants", json=payload, use_login=False)
-        except HTTPException as exc:
-            logger.warning("POS business exists but could not be updated; linking existing business: %s", exc.detail)
-            result = {"linked_existing": True, "data": existing}
-    else:
-        result = await pos_core_session_request("POST", "admincore/tenants", json=payload, use_login=False)
-        created = result.get("data") if isinstance(result, dict) and "data" in result else result
-        if isinstance(created, dict):
-            pos_business_id = str(created.get("id") or created.get("business_id") or pos_business_id)
-            tenant_id = created.get("tenantId") or created.get("tenant_id") or tenant_id
+    result = await pos_core_session_request("POST", "admincore/tenants", json=payload, use_login=False)
+    created = result.get("data", result) if isinstance(result, dict) else None
+    created_business = created.get("business", created) if isinstance(created, dict) else None
+    if not isinstance(created_business, dict):
+        raise HTTPException(status_code=502, detail="POS provisioning returned no business identity")
+    returned_id = created_business.get("id") or created_business.get("business_id")
+    returned_tenant = created_business.get("tenantId") or created_business.get("tenant_id")
+    if str(returned_id or "") != str(pos_business_id) or str(returned_tenant or "") != str(tenant_id):
+        raise HTTPException(status_code=502, detail="POS provisioning returned a different business or tenant identity")
     await db.businesses.update_one(
         {"id": business_id},
         {"$set": {"pos_external_id": pos_business_id, "pos_tenant_id": tenant_id, "pos_synced": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
@@ -3966,13 +3952,15 @@ async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
     await ensure_default_outlet_for_business(business_id, sync_to_pos=False, pos_business_id=pos_business_id, pos_tenant_id=tenant_id)
     return {"business_id": pos_business_id, "tenant_id": tenant_id, "result": result}
 
-async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None, allow_generated_password: bool = False):
+async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None, allow_generated_password: bool = False, target_business_id: Optional[str] = None):
     business_ids = user_doc.get("business_ids") or []
     if not POS_CORE_API_BASE_URL or not business_ids:
         return None
     if not user_doc.get("email"):
         return None
-    business_id = business_ids[0]
+    business_id = target_business_id or business_ids[0]
+    if business_id not in business_ids:
+        raise HTTPException(status_code=403, detail="User is not assigned to the requested POS business")
     pos_headers = await pos_headers_for_admin_business(business_id)
     business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
     outlet = await ensure_default_outlet_for_business(
@@ -4479,7 +4467,10 @@ async def sync_bridge_pos_record(config: dict, row: dict, business_id: Optional[
 
 @pos_bridge_router.get("/config")
 async def get_pos_bridge_config(request: Request):
-    await get_current_user(request)
+    if request.headers.get("x-admincore-api-key") or request.headers.get("x-api-key"):
+        require_pos_bridge_sync_key(request)
+    else:
+        await get_current_user(request)
     return {
         "configured": bool(POS_CORE_API_BASE_URL),
         "base_url": POS_CORE_API_BASE_URL,
@@ -4699,14 +4690,37 @@ async def receive_pos_bridge_sync_status(request: Request):
             now_ts,
         )
 
-    result = await sync_pos_bridge_resource_for_system(resource, business_id, user)
+    if not business_id:
+        raise HTTPException(status_code=409, detail="POS business mapping is required before sync")
+    scope = await expected_pos_scope_for_business(business_id)
+    validate_pos_row_scope(resource, payload, scope)
+    event_id = str(payload.get("id") or "").strip()
+    if not event_id or len(event_id) > 200:
+        raise HTTPException(status_code=400, detail="A stable POS event ID is required")
+    try:
+        result = await pos_sync_worker.enqueue(event_id, resource, business_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "accepted": True,
-        "message": "POS change notification received and synced",
+        "message": "POS change notification durably queued",
         "resource": resource,
         "business_id": business_id,
         "result": result,
     }
+
+async def process_pos_change(resource, business_id):
+    user = await get_pos_bridge_system_user()
+    return await sync_pos_bridge_resource_for_system(resource, business_id, user)
+
+pos_sync_worker = PosSyncWorker(db.pos_change_jobs, process_pos_change)
+
+@pos_bridge_router.get("/change-jobs")
+async def list_pos_change_jobs(request: Request, business_id: Optional[str] = Query(None)):
+    user = await get_current_user(request)
+    await require_pos_bridge_access(user, business_id)
+    scope = await pos_business_filter(user, business_id)
+    return await db.pos_change_jobs.find(scope, {"_id": 0, "lease": 0}).sort("created_at", -1).limit(100).to_list(100)
 
 @pos_bridge_router.post("/sync-all")
 async def sync_all_pos_bridge_resources(request: Request, business_id: Optional[str] = Query(None)):
@@ -5256,6 +5270,7 @@ async def startup():
     asyncio.create_task(maintenance_task())
     if POS_PROVISIONING_WORKER_ENABLED:
         asyncio.create_task(pos_provisioning_worker())
+    asyncio.create_task(pos_sync_worker.run_forever())
     logger.info("AdminCore API startup ready")
 
 

@@ -122,7 +122,7 @@ export default function BusinessesPage() {
     setRetryingId(retryBusiness.id);
     try {
       await api.post(`/businesses/${retryBusiness.id}/provision-pos`, retryForm);
-      toast.success('POS provisioning completed');
+      toast.success('POS provisioning queued. Check the business status for progress.');
       setRetryBusiness(null);
       fetchBusinesses();
       refreshBusinesses();
