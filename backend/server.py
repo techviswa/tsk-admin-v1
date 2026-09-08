@@ -33,7 +33,12 @@ from pos_sync_batch import run_sync_batch
 from production_config import validate_production_config
 
 # ===== CONFIGURATION =====
-validate_production_config(os.environ)
+PRODUCTION_CONFIG_STATUS = validate_production_config(os.environ, raise_on_error=False)
+if not PRODUCTION_CONFIG_STATUS.get("ok", True):
+    logging.getLogger("admincore.config").error(
+        "Production configuration needs attention: %s",
+        "; ".join(PRODUCTION_CONFIG_STATUS.get("errors", [])),
+    )
 JWT_ALGORITHM = "HS256"
 JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
 POS_CORE_API_BASE_URL = os.environ.get("POS_CORE_API_BASE_URL", "").rstrip("/")
@@ -74,6 +79,8 @@ async def health_check():
         "service": "admincore",
         "time": datetime.now(timezone.utc).isoformat(),
         "pos_configured": bool(POS_CORE_API_BASE_URL),
+        "production_config_ok": PRODUCTION_CONFIG_STATUS.get("ok", True),
+        "production_config_errors": PRODUCTION_CONFIG_STATUS.get("errors", []),
     }
 
 # ===== LOGGING =====
