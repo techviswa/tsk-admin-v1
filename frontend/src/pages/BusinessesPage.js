@@ -174,7 +174,7 @@ export default function BusinessesPage() {
                 </TableCell>
                 <TableCell className="text-zinc-600 capitalize py-3">{biz.type}</TableCell>
                 <TableCell className="py-3"><Badge variant="outline" className="text-[11px] capitalize">{biz.plan}</Badge></TableCell>
-                <TableCell className="py-3"><Badge className={`text-[11px] ${statusColor(biz.status)}`}>{biz.status}</Badge></TableCell>
+                <TableCell className="py-3"><Badge className={`text-[11px] ${statusColor(biz.operational_ready === false ? 'pending' : biz.status)}`}>{biz.operational_ready === false && biz.status === 'active' ? 'Not ready' : biz.status}</Badge></TableCell>
                 <TableCell className="py-3">
                   <div className="space-y-1">
                     <Badge className={`text-[11px] ${posStatusColor(biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not_configured'))}`}>
@@ -193,10 +193,10 @@ export default function BusinessesPage() {
                     <Button variant="outline" size="sm" className="h-8 gap-1.5 border-zinc-200" onClick={() => openOperation(biz, '/')}>
                       <Gauge className="h-3.5 w-3.5" />Overview
                     </Button>
-                    <Button variant="outline" size="sm" className="h-8 gap-1.5 border-zinc-200" onClick={() => openOperation(biz, '/outlets')}>
+                    <Button variant="outline" size="sm" className="h-8 gap-1.5 border-zinc-200" disabled={biz.operational_ready === false} onClick={() => openOperation(biz, '/outlets')}>
                       <MapPin className="h-3.5 w-3.5" />Outlets
                     </Button>
-                    <Button variant="outline" size="sm" className="h-8 gap-1.5 border-zinc-200" onClick={() => openOperation(biz, '/products')}>
+                    <Button variant="outline" size="sm" className="h-8 gap-1.5 border-zinc-200" disabled={biz.operational_ready === false} onClick={() => openOperation(biz, '/products')}>
                       <Package className="h-3.5 w-3.5" />Products
                     </Button>
                   </div>

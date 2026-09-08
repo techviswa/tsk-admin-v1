@@ -48,6 +48,12 @@ jobs:
       - name: Run backend entitlement tests
         run: python backend/test_entitlements.py
 
+      - name: Run sync reliability tests
+        run: python -m unittest discover -s backend -p "test_pos_sync_*.py"
+
+      - name: Run production guards
+        run: python -m unittest discover -s backend -p "test_production_*.py"
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-import { useState, createContext, useContext, useEffect, useCallback } from 'react';
+import { useState, createContext, useContext, useEffect, useCallback, useRef } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
@@ -50,6 +50,7 @@ export default function DashboardLayout() {
   const [selectedBusiness, setSelectedBusiness] = useState(null);
   const [businessModules, setBusinessModules] = useState([]);
   const [modulesLoading, setModulesLoading] = useState(false);
+  const moduleRequest = useRef(0);
   const [mobileOpen, setMobileOpen] = useState(false);
   const moduleSet = enabledModuleSet(businessModules);
 
@@ -65,6 +66,7 @@ export default function DashboardLayout() {
   useEffect(() => { fetchBusinesses(); }, [fetchBusinesses]);
 
   const fetchBusinessModules = useCallback(async () => {
+    const requestId = ++moduleRequest.current;
     if (!selectedBusiness?.id) {
       setBusinessModules([]);
       setModulesLoading(false);
@@ -73,11 +75,11 @@ export default function DashboardLayout() {
     setModulesLoading(true);
     try {
       const { data } = await api.get(`/modules/business/${selectedBusiness.id}`);
-      setBusinessModules(data || []);
+      if (requestId === moduleRequest.current) setBusinessModules(data || []);
     } catch {
-      setBusinessModules([]);
+      if (requestId === moduleRequest.current) setBusinessModules([]);
     } finally {
-      setModulesLoading(false);
+      if (requestId === moduleRequest.current) setModulesLoading(false);
     }
   }, [selectedBusiness]);
 
@@ -86,6 +88,9 @@ export default function DashboardLayout() {
   }, [fetchBusinessModules]);
 
   const selectBusiness = (biz) => {
+    moduleRequest.current += 1;
+    setBusinessModules([]);
+    setModulesLoading(Boolean(biz));
     setSelectedBusiness(biz);
     if (biz?.id) localStorage.setItem('selectedBusinessId', biz.id);
     else localStorage.removeItem('selectedBusinessId');
@@ -247,7 +252,7 @@ export default function DashboardLayout() {
         {/* Main Content */}
         <main className="pt-14 md:pl-64 min-h-screen">
           <div className="max-w-7xl mx-auto p-4 md:p-8 space-y-8">
-            <Outlet />
+            <Outlet key={selectedBusiness?.id || 'platform'} />
           </div>
         </main>
       </div>

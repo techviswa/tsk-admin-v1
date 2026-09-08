@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
 import api from '@/lib/api';
@@ -28,7 +28,7 @@ export default function AuditLogsPage() {
   const [entityFilter, setEntityFilter] = useState('all');
   const limit = 20;
 
-  const fetchLogs = async () => {
+  const fetchLogs = useCallback(async (signal) => {
     try {
       let url, params;
       if (selectedBusiness) {
@@ -41,19 +41,24 @@ export default function AuditLogsPage() {
         setLoading(false);
         return;
       }
-      const { data } = await api.get(url, { params });
+      const { data } = await api.get(url, { params, signal });
       let filteredLogs = data.logs || [];
       if (entityFilter !== 'all') {
         filteredLogs = filteredLogs.filter(l => l.entity_type === entityFilter);
       }
       setLogs(filteredLogs);
       setTotal(data.total || 0);
-    } catch { toast.error('Failed to load audit logs'); }
-    finally { setLoading(false); }
-  };
+    } catch { if (!signal?.aborted) toast.error('Failed to load audit logs'); }
+    finally { if (!signal?.aborted) setLoading(false); }
+  }, [selectedBusiness, user?.role, page, entityFilter]);
 
-  useEffect(() => { setLoading(true); setPage(0); fetchLogs(); }, [selectedBusiness, entityFilter]);
-  useEffect(() => { fetchLogs(); }, [page]);
+  useEffect(() => { setPage(0); }, [selectedBusiness, entityFilter]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    fetchLogs(controller.signal);
+    return () => controller.abort();
+  }, [fetchLogs]);
 
   const totalPages = Math.ceil(total / limit);
   const entities = ['all', 'business', 'outlet', 'module', 'user', 'setting', 'feature_flag', 'integration', 'auth'];

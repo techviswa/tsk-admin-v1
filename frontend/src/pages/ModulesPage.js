@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
 import api, { formatApiError } from '@/lib/api';
@@ -105,16 +105,16 @@ export default function ModulesPage() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
-  const fetchModules = async () => {
+  const fetchModules = useCallback(async () => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
       const { data } = await api.get(`/modules/business/${selectedBusiness.id}`);
       setModules(data);
     } catch { toast.error('Failed to load modules'); }
     finally { setLoading(false); }
-  };
+  }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchModules(); }, [selectedBusiness]);
+  useEffect(() => { setLoading(true); fetchModules(); }, [fetchModules]);
 
   const toggleModule = async (mod) => {
     const outsidePlan = mod.outside_plan || !mod.included;

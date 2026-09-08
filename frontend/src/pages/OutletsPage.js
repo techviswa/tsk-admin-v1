@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -20,16 +20,16 @@ export default function OutletsPage() {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ name: '', code: '', address: '', manager_name: '', phone: '', status: 'active' });
 
-  const fetchOutlets = async () => {
+  const fetchOutlets = useCallback(async () => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
       const { data } = await api.get(`/outlets/business/${selectedBusiness.id}`);
       setOutlets(data);
     } catch { toast.error('Failed to load outlets'); }
     finally { setLoading(false); }
-  };
+  }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchOutlets(); }, [selectedBusiness]);
+  useEffect(() => { setLoading(true); fetchOutlets(); }, [fetchOutlets]);
 
   if (!selectedBusiness) {
     return (

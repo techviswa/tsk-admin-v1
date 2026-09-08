@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -21,16 +21,16 @@ export default function FeatureFlagsPage() {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ key: '', name: '', description: '', enabled: false });
 
-  const fetchFlags = async () => {
+  const fetchFlags = useCallback(async () => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
       const { data } = await api.get(`/feature-flags/business/${selectedBusiness.id}`);
       setFlags(data);
     } catch { toast.error('Failed to load feature flags'); }
     finally { setLoading(false); }
-  };
+  }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchFlags(); }, [selectedBusiness]);
+  useEffect(() => { setLoading(true); fetchFlags(); }, [fetchFlags]);
 
   if (!selectedBusiness) {
     return (

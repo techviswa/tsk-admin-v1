@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -22,16 +22,16 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  const fetchSettings = async () => {
+  const fetchSettings = useCallback(async () => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
       const { data } = await api.get(`/settings/business/${selectedBusiness.id}`);
       setSettings(data);
     } catch { toast.error('Failed to load settings'); }
     finally { setLoading(false); }
-  };
+  }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchSettings(); }, [selectedBusiness]);
+  useEffect(() => { setLoading(true); fetchSettings(); }, [fetchSettings]);
 
   const getValue = (key) => settings.find(s => s.key === key)?.value || '';
   const setValue = (key, value) => setSettings(prev => prev.map(s => s.key === key ? { ...s, value } : s));

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -24,16 +24,16 @@ export default function IntegrationsPage() {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ slug: '', name: '', type: 'payment' });
 
-  const fetchIntegrations = async () => {
+  const fetchIntegrations = useCallback(async () => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
       const { data } = await api.get(`/integrations/business/${selectedBusiness.id}`);
       setIntegrations(data);
     } catch { toast.error('Failed to load integrations'); }
     finally { setLoading(false); }
-  };
+  }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchIntegrations(); }, [selectedBusiness]);
+  useEffect(() => { setLoading(true); fetchIntegrations(); }, [fetchIntegrations]);
 
   if (!selectedBusiness) {
     return (

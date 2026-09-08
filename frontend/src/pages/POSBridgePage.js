@@ -40,12 +40,6 @@ function errorText(error) {
   return JSON.stringify(error);
 }
 
-function shouldStopSyncAll(err) {
-  const status = err?.response?.status;
-  const code = err?.response?.data?.detail?.code;
-  return status === 401 || status === 403 || status === 429 || status >= 500 || err?.code === 'ECONNABORTED' || code === 'POS_RATE_LIMITED';
-}
-
 export default function POSBridgePage() {
   const { selectedBusiness } = useBusiness();
   const [config, setConfig] = useState(null);
@@ -81,7 +75,8 @@ export default function POSBridgePage() {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
       const { data } = await api.post(`/pos-bridge/sync/${resource}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
       setLastResult(data);
-      toast.success(`${data.count || 0} ${resource} synced`);
+      if (data.status === 'success') toast.success(`${data.count || 0} ${resource} synced`);
+      else toast.error(`${resource}: ${data.count || 0} synced, ${data.error_count || 0} failed`);
       load();
     } catch (err) {
       toast.error(formatApiError(err));
@@ -92,34 +87,13 @@ export default function POSBridgePage() {
 
   const syncAll = async () => {
     setSyncing('all');
-    const results = {};
-    setLastResult({ results });
+    setLastResult(null);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      for (const resource of resources) {
-        setSyncing(`all:${resource.key}`);
-        try {
-          const { data } = await api.post(`/pos-bridge/sync/${resource.key}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
-          results[resource.key] = data;
-        } catch (err) {
-          const reason = formatApiError(err);
-          results[resource.key] = {
-            resource: resource.key,
-            status: 'failed',
-            count: 0,
-            error_count: 1,
-            errors: [{ reason }],
-          };
-          setLastResult({ results: { ...results } });
-          if (shouldStopSyncAll(err)) {
-            toast.error(reason);
-            break;
-          }
-        }
-        setLastResult({ results: { ...results } });
-      }
-      const failed = Object.values(results).some(result => result?.status === 'failed' || result?.error_count > 0);
-      toast[failed ? 'error' : 'success'](failed ? 'POS bridge sync stopped with errors' : 'POS bridge sync completed');
+      const { data } = await api.post('/pos-bridge/sync-all', null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
+      setLastResult(data);
+      if (data.status === 'success') toast.success('POS bridge sync completed');
+      else toast.error(`POS sync incomplete. ${data.skipped_count || 0} resources skipped; review the results and retry.`);
       await load();
     } catch (err) {
       toast.error(formatApiError(err));

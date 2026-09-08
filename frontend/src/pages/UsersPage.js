@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
 import api, { formatApiError } from '@/lib/api';
@@ -37,7 +37,7 @@ export default function UsersPage() {
   const [form, setForm] = useState({ name: '', email: '', password: '', role: 'staff', status: 'active', business_ids: [] });
   const [showPassword, setShowPassword] = useState(false);
 
-  const fetchUsers = async () => {
+  const fetchUsers = useCallback(async () => {
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
       const { data } = await api.get('/users', { params });
@@ -45,9 +45,9 @@ export default function UsersPage() {
       setUsers(rows);
     } catch (err) { toast.error(`Failed to load users: ${formatApiError(err)}`); }
     finally { setLoading(false); }
-  };
+  }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchUsers(); }, [selectedBusiness]);
+  useEffect(() => { setLoading(true); fetchUsers(); }, [fetchUsers]);
 
   const openCreate = () => {
     setEditing(null);

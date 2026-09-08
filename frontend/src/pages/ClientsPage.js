@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -32,7 +32,7 @@ export default function ClientsPage() {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(emptyForm);
 
-  const fetchClients = async () => {
+  const fetchClients = useCallback(async () => {
     setLoading(true);
     try {
       const params = {
@@ -47,9 +47,12 @@ export default function ClientsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [selectedBusiness, status, search]);
 
-  useEffect(() => { fetchClients(); }, [selectedBusiness, status]);
+  useEffect(() => {
+    const timer = setTimeout(fetchClients, 300);
+    return () => clearTimeout(timer);
+  }, [fetchClients]);
 
   const openCreate = () => {
     setEditing(null);
