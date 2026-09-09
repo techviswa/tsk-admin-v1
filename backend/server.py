@@ -2330,7 +2330,7 @@ async def update_user(user_id: str, data: UserUpdate, request: Request):
     pos_push = []
     try:
         for target_business_id in updated_user.get("business_ids", []):
-            pushed = await push_admin_user_to_pos(updated_user, data.password, target_business_id=target_business_id)
+            pushed = await push_admin_user_to_pos(updated_user, data.password, target_business_id=target_business_id, previous_email=existing.get("email"))
             if pushed:
                 pos_push.append(pushed)
     except HTTPException as exc:
@@ -4029,7 +4029,7 @@ async def provision_admin_business_to_pos(business_id: str) -> Optional[dict]:
     await ensure_default_outlet_for_business(business_id, sync_to_pos=False, pos_business_id=pos_business_id, pos_tenant_id=tenant_id)
     return {"business_id": pos_business_id, "tenant_id": tenant_id, "result": result}
 
-async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None, allow_generated_password: bool = False, target_business_id: Optional[str] = None):
+async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None, allow_generated_password: bool = False, target_business_id: Optional[str] = None, previous_email: Optional[str] = None):
     business_ids = user_doc.get("business_ids") or []
     if not POS_CORE_API_BASE_URL or not business_ids:
         return None
@@ -4053,6 +4053,16 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
     existing_pos_user_id = pos_link.get("user_id") or (
         user_doc.get("pos_external_id") if user_doc.get("pos_business_id") == pos_business_id else None
     )
+    if not existing_pos_user_id and previous_email:
+        exported = await pos_bridge_request("staff", {}, business_id=business_id)
+        rows = await prepare_pos_bridge_rows("staff", exported, business_id)
+        matches = [row for row in rows if (row.get("email") or "").strip().lower() == previous_email.strip().lower()]
+        if len(matches) > 1:
+            raise HTTPException(status_code=409, detail="Multiple POS accounts match this user in the business; repair the user link before updating")
+        if matches:
+            existing_pos_user_id = matches[0].get("id")
+            if not existing_pos_user_id:
+                raise HTTPException(status_code=502, detail="POS staff export omitted the user ID")
     payload = {
         "name": user_doc.get("name") or user_doc["email"].split("@")[0],
         "email": user_doc["email"],

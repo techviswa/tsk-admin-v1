@@ -103,6 +103,7 @@ function formatDetailValue(value) {
   if (value.code) parts.push(value.code);
   if (value.status_code) parts.push(`HTTP ${value.status_code}`);
   if (value.context) parts.push(value.context);
+  if (value.cause) parts.push(formatDetailValue(value.cause));
   if (value.message) parts.push(formatDetailValue(value.message));
   if (value.detail) parts.push(formatDetailValue(value.detail));
   if (value.response) parts.push(formatDetailValue(value.response));
@@ -142,6 +143,7 @@ export function formatApiError(err) {
     if (detail.feature) parts.push(`feature: ${detail.feature}`);
     if (detail.limit) parts.push(`limit: ${detail.limit}`);
     if (detail.currentPlan) parts.push(`plan: ${detail.currentPlan}`);
+    if (detail.cause) parts.push(formatDetailValue(detail.cause));
     if (detail.message) parts.push(formatDetailValue(detail.message));
     if (detail.detail) parts.push(formatDetailValue(detail.detail));
     return shorten(parts.map(compact).filter(Boolean).join(' - '));

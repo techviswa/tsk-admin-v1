@@ -9,6 +9,31 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unlinked_user_email_edit_updates_scoped_existing_pos_account(self):
+        scope = {"business_id": "pos-a", "tenant_id": "tenant-a"}
+        business = {"id": "business-a", "pos_external_id": "pos-a", "pos_tenant_id": "tenant-a"}
+        database = SimpleNamespace(businesses=SimpleNamespace(find_one=AsyncMock(return_value=business)), users=SimpleNamespace(update_one=AsyncMock()))
+        user = {"id": "local-user", "email": "new@example.test", "business_ids": ["business-a"]}
+        for wrong_scope in [False, True]:
+            row = {"id": "original-pos-user", "email": "old@example.test", **scope}
+            if wrong_scope:
+                row["business_id"] = "other-business"
+            with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
+                 patch.object(server, "pos_headers_for_admin_business", new_callable=AsyncMock, return_value={}), \
+                 patch.object(server, "ensure_default_outlet_for_business", new_callable=AsyncMock, return_value={"pos_external_id": "outlet-a"}), \
+                 patch.object(server, "expected_pos_scope_for_business", new_callable=AsyncMock, return_value=scope), \
+                 patch.object(server, "pos_bridge_request", new_callable=AsyncMock, return_value={"items": [row]}), \
+                 patch.object(server, "pos_core_session_request", new_callable=AsyncMock, return_value={"id": "original-pos-user", **scope}) as write:
+                if wrong_scope:
+                    with self.assertRaises(server.HTTPException):
+                        await server.push_admin_user_to_pos(user, previous_email="old@example.test")
+                    write.assert_not_awaited()
+                else:
+                    await server.push_admin_user_to_pos(user, previous_email="old@example.test")
+                    self.assertEqual(write.call_args.args, ("PUT", "admincore/staff/original-pos-user"))
+                    self.assertEqual(write.call_args.kwargs["json"]["email"], "new@example.test")
+                    self.assertNotIn("password", write.call_args.kwargs["json"])
+
     async def test_bill_change_refreshes_derived_resources(self):
         sync = AsyncMock(return_value={"status": "success", "error_count": 0})
         with patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={}), \
