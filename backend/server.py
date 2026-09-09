@@ -210,7 +210,7 @@ def mark_pos_rate_limited(response=None) -> int:
             retry_after = int(response.headers.get("Retry-After", ""))
         except (TypeError, ValueError):
             retry_after = None
-    cooldown = max(retry_after or 0, POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS)
+    cooldown = max(1, retry_after) if retry_after is not None else POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS
     POS_CORE_RATE_LIMIT_UNTIL = max(POS_CORE_RATE_LIMIT_UNTIL, time.time() + cooldown)
     return cooldown
 
@@ -3954,6 +3954,11 @@ async def ensure_default_outlet_for_business(
     resolved_pos_tenant_id = pos_tenant_id or business.get("pos_tenant_id") or f"admincore-{business_id}"
     existing = await db.outlets.find_one({"business_id": business_id}, {"_id": 0}, sort=[("created_at", 1)])
     if existing:
+        verified_link = (
+            existing.get("pos_synced") and existing.get("pos_external_id")
+            and existing.get("pos_business_id") == resolved_pos_business_id
+            and existing.get("pos_tenant_id") == resolved_pos_tenant_id
+        )
         link_update = {
             "pos_business_id": resolved_pos_business_id,
             "pos_tenant_id": resolved_pos_tenant_id,
@@ -3961,7 +3966,7 @@ async def ensure_default_outlet_for_business(
         }
         await db.outlets.update_one({"id": existing["id"]}, {"$set": link_update})
         existing = {**existing, **link_update}
-        if sync_to_pos and POS_CORE_API_BASE_URL:
+        if sync_to_pos and POS_CORE_API_BASE_URL and not verified_link:
             try:
                 await push_admin_outlet_to_pos(existing, pos_headers={"business_id": resolved_pos_business_id, "x-tenant-id": resolved_pos_tenant_id})
                 existing = await db.outlets.find_one({"id": existing["id"]}, {"_id": 0})
@@ -4311,7 +4316,7 @@ async def sync_bridge_business(row: dict, user: dict, now_ts: str) -> str:
         await ensure_default_outlet_for_business(
             existing["id"],
             user=user,
-            sync_to_pos=bool(POS_CORE_API_BASE_URL),
+            sync_to_pos=False,
             pos_business_id=external_id,
             pos_tenant_id=row.get("tenantId") or row.get("tenant_id") or existing.get("pos_tenant_id"),
         )
@@ -4324,7 +4329,7 @@ async def sync_bridge_business(row: dict, user: dict, now_ts: str) -> str:
     await ensure_default_outlet_for_business(
         doc["id"],
         user=user,
-        sync_to_pos=bool(POS_CORE_API_BASE_URL),
+        sync_to_pos=False,
         pos_business_id=external_id,
         pos_tenant_id=row.get("tenantId") or row.get("tenant_id"),
     )

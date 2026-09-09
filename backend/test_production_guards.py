@@ -9,6 +9,27 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
+    def test_rate_limit_respects_pos_retry_after(self):
+        with patch.object(server, "POS_CORE_RATE_LIMIT_UNTIL", 0), patch.object(server.time, "time", return_value=100):
+            self.assertEqual(server.mark_pos_rate_limited(SimpleNamespace(headers={"Retry-After": "12"})), 12)
+            self.assertEqual(server.POS_CORE_RATE_LIMIT_UNTIL, 112)
+
+    async def test_ensuring_verified_outlet_does_not_write_back_to_pos(self):
+        outlet = {"id": "outlet", "pos_external_id": "pos-outlet", "pos_synced": True, "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a"}
+        database = SimpleNamespace(businesses=SimpleNamespace(find_one=AsyncMock(return_value={"pos_external_id": "pos-a", "pos_tenant_id": "tenant-a"})), outlets=SimpleNamespace(find_one=AsyncMock(return_value=outlet), update_one=AsyncMock()))
+        with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
+             patch.object(server, "push_admin_outlet_to_pos", new_callable=AsyncMock) as push:
+            result = await server.ensure_default_outlet_for_business("a")
+        self.assertEqual(result["pos_external_id"], "pos-outlet")
+        push.assert_not_awaited()
+
+    async def test_business_import_does_not_trigger_outbound_sync(self):
+        database = SimpleNamespace(businesses=SimpleNamespace(find_one=AsyncMock(return_value={"id": "a", "slug": "a"}), update_one=AsyncMock()))
+        with patch.object(server, "db", database), \
+             patch.object(server, "ensure_default_outlet_for_business", new_callable=AsyncMock) as outlet:
+            await server.sync_bridge_business({"id": "pos-a", "tenant_id": "tenant-a"}, {"id": "admin"}, "now")
+        self.assertFalse(outlet.call_args.kwargs["sync_to_pos"])
+
     def test_staff_export_alias_uses_registered_endpoint(self):
         self.assertEqual(server.pos_bridge_resource("staff"), server.pos_bridge_resource("staff-shifts"))
 
