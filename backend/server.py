@@ -3454,6 +3454,8 @@ POS_BRIDGE_RESOURCES = {
 }
 
 def pos_bridge_resource(resource: str) -> dict:
+    if resource == "staff":
+        resource = "staff-shifts"
     config = POS_BRIDGE_RESOURCES.get(resource)
     if not config:
         raise HTTPException(status_code=404, detail="POS bridge resource not found")
@@ -4455,10 +4457,23 @@ async def sync_bridge_staff_user(row: dict, business_id: str, now_ts: str) -> Op
     email = (row.get("email") or "").strip().lower()
     if not email:
         return None
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    external_id = external_id_for(row)
+    existing = await db.users.find_one({"business_ids": business_id, "$or": [
+        {f"pos_links.{business_id}.user_id": external_id},
+        {"pos_external_id": external_id, "pos_business_id": pos_row_business_id(row)},
+    ]}, {"_id": 0})
+    email_owner = await db.users.find_one({"email": email}, {"_id": 0})
+    if email_owner and (not existing or email_owner["id"] != existing["id"]):
+        if existing or business_id not in email_owner.get("business_ids", []) or email_owner.get("role") in {"platform_admin", "support_admin"}:
+            raise HTTPException(status_code=409, detail="POS staff email conflicts with another AdminCore account")
+        existing = email_owner
+    if existing and existing.get("role") in {"platform_admin", "support_admin"}:
+        raise HTTPException(status_code=409, detail="POS staff sync cannot modify a platform account")
     role = normalize_pos_staff_role(row.get("role"))
     status = "active" if row.get("active", True) is not False and str(row.get("status", "active")).lower() != "inactive" else "inactive"
     update = {
+        "email": email,
+        f"pos_links.{business_id}": {"user_id": external_id, "business_id": pos_row_business_id(row), "tenant_id": pos_row_tenant_id(row)},
         "name": row.get("name") or row.get("staffName") or email.split("@")[0],
         "role": role,
         "status": status,
@@ -4477,11 +4492,12 @@ async def sync_bridge_staff_user(row: dict, business_id: str, now_ts: str) -> Op
     doc = {
         "id": str(ObjectId()),
         "email": email,
-        "password_hash": hash_password(known_pos_staff_password(email)),
+        "password_hash": hash_password(secrets.token_urlsafe(32)),
         "business_ids": [business_id],
         "created_at": now_ts,
         **update,
     }
+    doc["pos_links"] = {business_id: doc.pop(f"pos_links.{business_id}")}
     await db.users.insert_one(doc)
     return doc["id"]
 
@@ -4770,7 +4786,7 @@ async def receive_pos_bridge_sync_status(request: Request):
         resource = "tables"
     if resource in ["reservation", "table-reservations"]:
         resource = "reservations"
-    resource = {"kot": "kitchen-tickets", "qr": "qr-ordering"}.get(resource, resource)
+    resource = {"staff": "staff-shifts", "kot": "kitchen-tickets", "qr": "qr-ordering"}.get(resource, resource)
     if resource not in POS_BRIDGE_RESOURCES:
         raise HTTPException(status_code=400, detail=f"Unsupported POS bridge resource: {resource}")
 
@@ -4816,7 +4832,7 @@ async def process_pos_change(resource, business_id, event=None):
     result = await sync_pos_bridge_resource_for_system(resource, business_id, user)
     if result.get("error_count") or result.get("status") != "success":
         return result
-    if event and event.get("action") == "deleted" and resource in {"products", "inventory", "orders", "bills"}:
+    if event and event.get("action") == "deleted" and resource in set(POS_BRIDGE_RESOURCES) - {"businesses", "staff-shifts"}:
         external_id = event["record_id"]
         # A delayed delete must not remove a record that currently exists in POS.
         if external_id not in {row.get("external_id") for row in result.get("synced", [])}:

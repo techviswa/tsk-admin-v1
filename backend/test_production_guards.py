@@ -9,6 +9,49 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
+    def test_staff_export_alias_uses_registered_endpoint(self):
+        self.assertEqual(server.pos_bridge_resource("staff"), server.pos_bridge_resource("staff-shifts"))
+
+    async def test_pos_staff_notification_is_durably_accepted(self):
+        payload = {"id": "event-a", "resource": "staff", "admincore_business_id": "a", "business_id": "pos-a", "tenant_id": "tenant-a", "action": "updated", "record_id": "user-a"}
+        request = SimpleNamespace(json=AsyncMock(return_value=payload))
+        with patch.object(server, "require_pos_bridge_sync_key"), \
+             patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={}), \
+             patch.object(server, "expected_pos_scope_for_business", new_callable=AsyncMock, return_value={"business_id": "pos-a", "tenant_id": "tenant-a"}), \
+             patch.object(server.pos_sync_worker, "enqueue", new_callable=AsyncMock, return_value={"status": "pending"}) as enqueue:
+            result = await server.receive_pos_bridge_sync_status(request)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(enqueue.call_args.args, ("event-a", "staff-shifts", "a"))
+
+    async def test_staff_email_change_preserves_local_identity(self):
+        users = SimpleNamespace(find_one=AsyncMock(side_effect=[{"id": "local", "role": "staff", "business_ids": ["a"]}, None]), update_one=AsyncMock(), insert_one=AsyncMock())
+        row = {"id": "pos-user", "email": "changed@example.test", "business_id": "pos-a", "tenant_id": "tenant-a"}
+        with patch.object(server, "db", SimpleNamespace(users=users)), patch.object(server, "assert_pos_row_scope", new_callable=AsyncMock):
+            result = await server.sync_bridge_staff_user(row, "a", "now")
+        self.assertEqual(result, "local")
+        self.assertEqual(users.update_one.call_args.args[1]["$set"]["email"], row["email"])
+        self.assertEqual(users.update_one.call_args.args[1]["$set"]["pos_links.a"]["user_id"], "pos-user")
+        users.insert_one.assert_not_awaited()
+
+    async def test_staff_import_cannot_take_over_unrelated_or_platform_account(self):
+        for account in [{"id": "other", "role": "staff", "business_ids": ["b"]}, {"id": "admin", "role": "platform_admin", "business_ids": ["a"]}]:
+            users = SimpleNamespace(find_one=AsyncMock(side_effect=[None, account]), update_one=AsyncMock(), insert_one=AsyncMock())
+            with patch.object(server, "db", SimpleNamespace(users=users)), patch.object(server, "assert_pos_row_scope", new_callable=AsyncMock):
+                with self.assertRaises(server.HTTPException):
+                    await server.sync_bridge_staff_user({"id": "pos-user", "email": "same@example.test"}, "a", "now")
+            users.update_one.assert_not_awaited()
+            users.insert_one.assert_not_awaited()
+
+    async def test_delete_notifications_reconcile_all_supported_mirror_resources(self):
+        for resource in set(server.POS_BRIDGE_RESOURCES) - {"businesses", "staff-shifts"}:
+            collection = SimpleNamespace(delete_many=AsyncMock())
+            with patch.object(server, "db", {server.pos_bridge_resource(resource)["collection"]: collection}), \
+                 patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={}), \
+                 patch.object(server, "expected_pos_scope_for_business", new_callable=AsyncMock, return_value={"business_id": "pos-a", "tenant_id": "tenant-a"}), \
+                 patch.object(server, "sync_pos_bridge_resource_for_system", new_callable=AsyncMock, return_value={"status": "success", "synced": []}):
+                await server.process_pos_change(resource, "a", {"action": "deleted", "record_id": "deleted-id"})
+            collection.delete_many.assert_awaited_once_with({"business_id": "a", "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a", "pos_external_id": "deleted-id"})
+
     async def test_unlinked_user_email_edit_updates_scoped_existing_pos_account(self):
         scope = {"business_id": "pos-a", "tenant_id": "tenant-a"}
         business = {"id": "business-a", "pos_external_id": "pos-a", "pos_tenant_id": "tenant-a"}
