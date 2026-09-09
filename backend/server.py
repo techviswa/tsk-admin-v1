@@ -13,6 +13,8 @@ import asyncio
 import base64
 import re
 import time
+import math
+import threading
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
@@ -29,7 +31,7 @@ import bcrypt
 import jwt as pyjwt
 import qrcode
 from pos_sync_worker import PosSyncWorker
-from pos_sync_batch import run_sync_batch
+from pos_retry import retry_after_seconds, rate_limit_delay
 from production_config import validate_production_config
 
 # ===== CONFIGURATION =====
@@ -55,8 +57,9 @@ POS_PROVISIONING_WORKER_INTERVAL_SECONDS = int(os.environ.get("POS_PROVISIONING_
 POS_PROVISIONING_INITIAL_DELAY_SECONDS = int(os.environ.get("POS_PROVISIONING_INITIAL_DELAY_SECONDS", "20"))
 POS_PROVISIONING_RETRY_DELAYS_SECONDS = [30, 60, 180, 300, 600, 900]
 POS_CORE_RATE_LIMIT_UNTIL = 0.0
-POS_SYNC_ALL_TIMEOUT_SECONDS = max(1, int(os.environ.get("POS_SYNC_ALL_TIMEOUT_SECONDS", "20")))
-pos_sync_all_lock = asyncio.Lock()
+POS_CORE_REQUEST_INTERVAL_SECONDS = max(0.0, float(os.environ.get("POS_CORE_REQUEST_INTERVAL_SECONDS", "1")))
+pos_request_lock = threading.Lock()
+pos_next_request_at = 0.0
 
 # ===== DATABASE =====
 mongo_url = os.environ['MONGO_URL']
@@ -174,7 +177,7 @@ def compact_bridge_error_detail(detail) -> dict:
     compact = {
         key: value
         for key, value in detail.items()
-        if key in ["code", "resource", "endpoint", "status_code", "url", "context", "message", "tried"]
+        if key in ["code", "resource", "endpoint", "status_code", "url", "context", "message", "tried", "retry_after_seconds"]
     }
     response = detail.get("response")
     if response is not None:
@@ -200,19 +203,31 @@ def requests_error_detail(exc: requests.RequestException, context: str) -> dict:
     return detail
 
 def pos_rate_limit_seconds_remaining() -> int:
-    return max(0, int(POS_CORE_RATE_LIMIT_UNTIL - time.time()))
+    return max(0, math.ceil(POS_CORE_RATE_LIMIT_UNTIL - time.time()))
 
 def mark_pos_rate_limited(response=None) -> int:
     global POS_CORE_RATE_LIMIT_UNTIL
-    retry_after = None
-    if response is not None:
-        try:
-            retry_after = int(response.headers.get("Retry-After", ""))
-        except (TypeError, ValueError):
-            retry_after = None
-    cooldown = max(1, retry_after) if retry_after is not None else POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS
+    cooldown = retry_after_seconds(response.headers.get("Retry-After") if response is not None else None,
+                                  time.time(), POS_CORE_RATE_LIMIT_COOLDOWN_SECONDS)
     POS_CORE_RATE_LIMIT_UNTIL = max(POS_CORE_RATE_LIMIT_UNTIL, time.time() + cooldown)
-    return cooldown
+    return pos_rate_limit_seconds_remaining()
+
+def send_pos_request(session, method, url, **kwargs):
+    global pos_next_request_at
+    # All bridge callers, including pagination and login, share the same gate.
+    with pos_request_lock:
+        raise_if_pos_rate_limited(url)
+        delay = pos_next_request_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            response = session.request(method, url, **kwargs)
+            if response.status_code == 429:
+                mark_pos_rate_limited(response)
+                raise_if_pos_rate_limited(url)
+            return response
+        finally:
+            pos_next_request_at = time.monotonic() + POS_CORE_REQUEST_INTERVAL_SECONDS
 
 def raise_if_pos_rate_limited(resource: str):
     remaining = pos_rate_limit_seconds_remaining()
@@ -234,7 +249,7 @@ def pos_core_login(session: requests.Session, headers: dict, email: Optional[str
     last_exc = None
     for attempt in range(3):
         try:
-            response = session.post(
+            response = send_pos_request(session, "POST",
                 login_url,
                 json={"email": login_email, "password": login_password},
                 headers=headers,
@@ -406,7 +421,8 @@ async def run_pos_provisioning_job(job: dict):
         )
     except Exception as exc:
         detail = pos_error_detail(exc)
-        status = "failed" if attempts >= int(job.get("max_attempts") or POS_PROVISIONING_MAX_ATTEMPTS) else "retrying"
+        cooldown = rate_limit_delay(detail)
+        status = "failed" if not cooldown and attempts >= int(job.get("max_attempts") or POS_PROVISIONING_MAX_ATTEMPTS) else "retrying"
         update = {
             "status": status,
             "last_error": detail,
@@ -414,6 +430,9 @@ async def run_pos_provisioning_job(job: dict):
         }
         if status == "retrying":
             update["run_after"] = next_pos_provisioning_retry_at(attempts)
+            if cooldown:
+                update["attempts"] = attempts - 1
+                update["run_after"] = max(update["run_after"], (datetime.now(timezone.utc) + timedelta(seconds=cooldown)).isoformat())
         else:
             update["owner_password"] = ""
             update["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -3768,7 +3787,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
         last_response = None
         for index, endpoint in enumerate(endpoint_candidates):
             url = f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}"
-            response = session.get(url, params=request_params, headers=headers, timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS)
+            response = send_pos_request(session, "GET", url, params=request_params, headers=headers, timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS)
             last_response = response
             if response.status_code == 429:
                 cooldown = mark_pos_rate_limited(response)
@@ -3782,7 +3801,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
             if response.status_code == 404 and index < len(endpoint_candidates) - 1:
                 continue
             if resource == "businesses" and response.status_code == 404:
-                products_response = session.get(
+                products_response = send_pos_request(session, "GET",
                     f"{POS_CORE_API_BASE_URL}/api/products",
                     params=request_params,
                     headers=headers,
@@ -3818,7 +3837,7 @@ async def pos_bridge_request(resource: str, params: dict | None = None, business
                 if not isinstance(next_offset, int) or next_offset <= previous_offset or pages >= 200:
                     raise HTTPException(status_code=502, detail={"code": "POS_PAGINATION_INVALID", "message": "POS export pagination did not complete; no partial snapshot was imported."})
                 next_params = {**request_params, "offset": next_offset, "limit": pagination["limit"]}
-                next_response = session.get(url, params=next_params, headers=headers, timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS)
+                next_response = send_pos_request(session, "GET", url, params=next_params, headers=headers, timeout=POS_CORE_REQUEST_TIMEOUT_SECONDS)
                 next_response.raise_for_status()
                 next_payload = next_response.json()
                 if next_payload.get("business_id") != payload.get("business_id") or next_payload.get("tenant_id") != payload.get("tenant_id"):
@@ -3867,7 +3886,7 @@ async def pos_core_session_request(method: str, endpoint: str, json: dict | None
         session = requests.Session()
         if use_login:
             pos_core_login(session, headers, login_email, login_password)
-        response = session.request(
+        response = send_pos_request(session,
             method,
             f"{POS_CORE_API_BASE_URL}/api/{endpoint.strip('/')}",
             json=json,
@@ -3905,17 +3924,11 @@ async def pos_headers_for_admin_business(business_id: Optional[str]) -> dict:
         {"_id": 0, "id": 1, "pos_external_id": 1, "pos_tenant_id": 1},
     )
     if not business:
-        return {}
-    pos_business_id = str(business.get("pos_external_id") or business.get("id") or business_id)
-    tenant_id = str(business.get("pos_tenant_id") or f"admincore-{business_id}")
-    update = {}
-    if not business.get("pos_external_id"):
-        update["pos_external_id"] = pos_business_id
-    if not business.get("pos_tenant_id"):
-        update["pos_tenant_id"] = tenant_id
-    if update:
-        update["updated_at"] = datetime.now(timezone.utc).isoformat()
-        await db.businesses.update_one({"id": business_id}, {"$set": update})
+        raise HTTPException(status_code=404, detail="Business not found")
+    if not business.get("pos_external_id") or not business.get("pos_tenant_id"):
+        raise HTTPException(status_code=409, detail={"code": "POS_TENANT_SCOPE_MISSING", "message": "Complete POS business provisioning before syncing records."})
+    pos_business_id = str(business["pos_external_id"])
+    tenant_id = str(business["pos_tenant_id"])
     return {
         "business_id": pos_business_id,
         "x-business-id": pos_business_id,
@@ -4129,7 +4142,11 @@ async def push_admin_product_to_pos(product_doc: dict):
     pos_headers = await pos_headers_for_admin_business(business_id)
     pos_business_id = pos_headers.get("business_id") or pos_headers.get("x-business-id") or business_id
     pos_tenant_id = pos_headers.get("tenant_id") or pos_headers.get("x-tenant-id") or f"admincore-{business_id}"
-    product_rows = normalize_pos_bridge_rows(await pos_bridge_request("products", {}, business_id=business_id))
+    linked = (product_doc.get("pos_external_id")
+              and product_doc.get("pos_business_id") == pos_business_id
+              and product_doc.get("pos_tenant_id") == pos_tenant_id)
+    product_rows = ([{"id": product_doc["pos_external_id"]}] if linked else
+                    normalize_pos_bridge_rows(await pos_bridge_request("products", {}, business_id=business_id)))
     existing = next(
         (
             row for row in product_rows
@@ -4156,6 +4173,11 @@ async def push_admin_product_to_pos(product_doc: dict):
         result = await pos_core_session_request("POST", "admincore/products", json=payload, extra_headers=pos_headers, use_login=False)
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_product_id = created.get("id") if isinstance(created, dict) else None
+    created = result.get("data", result) if isinstance(result, dict) else None
+    if (not isinstance(created, dict) or not pos_product_id or created.get("id") != pos_product_id
+            or str(created.get("business_id") or created.get("businessId") or "") != str(pos_business_id)
+            or str(created.get("tenant_id") or created.get("tenantId") or "") != str(pos_tenant_id)):
+        raise HTTPException(status_code=502, detail={"code": "POS_PRODUCT_SCOPE_MISMATCH", "message": "POS returned an unverified product identity"})
     if pos_product_id:
         await db.products.update_one(
             {"id": product_doc["id"]},
@@ -4174,7 +4196,11 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
     if not POS_CORE_API_BASE_URL or not business_id:
         return None
     pos_headers = pos_headers or await pos_headers_for_admin_business(business_id)
-    outlet_rows = normalize_pos_bridge_rows(await pos_bridge_request("outlets", {}, business_id=business_id))
+    linked = (outlet_doc.get("pos_external_id")
+              and outlet_doc.get("pos_business_id") == pos_headers.get("business_id")
+              and outlet_doc.get("pos_tenant_id") == pos_headers.get("x-tenant-id"))
+    outlet_rows = ([{"id": outlet_doc["pos_external_id"]}] if linked else
+                   normalize_pos_bridge_rows(await pos_bridge_request("outlets", {}, business_id=business_id)))
     outlet_name = (outlet_doc.get("name") or "").strip().lower()
     outlet_code = (outlet_doc.get("code") or "").strip().lower()
     existing = next(
@@ -4195,9 +4221,9 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
         "managerName": outlet_doc.get("manager_name") or "",
         "phone": outlet_doc.get("phone") or "",
         "status": outlet_doc.get("status") or "active",
-        "business_id": outlet_doc.get("pos_business_id") or pos_headers.get("business_id") or business_id,
-        "tenantId": outlet_doc.get("pos_tenant_id") or pos_headers.get("x-tenant-id") or "",
-        "tenant_id": outlet_doc.get("pos_tenant_id") or pos_headers.get("x-tenant-id") or "",
+        "business_id": pos_headers.get("business_id") or business_id,
+        "tenantId": pos_headers.get("x-tenant-id") or "",
+        "tenant_id": pos_headers.get("x-tenant-id") or "",
     }
     if existing:
         result = await pos_core_session_request("PUT", f"admincore/outlets/{existing['id']}", json=payload, extra_headers=pos_headers, use_login=False)
@@ -4207,7 +4233,7 @@ async def push_admin_outlet_to_pos(outlet_doc: dict, pos_headers: Optional[dict]
         created = result.get("data") if isinstance(result, dict) and "data" in result else result
         pos_outlet_id = created.get("id") if isinstance(created, dict) else None
     created = result.get("data", result) if isinstance(result, dict) else None
-    if not isinstance(created, dict) or not pos_outlet_id or created.get("id") != pos_outlet_id or str(created.get("business_id") or created.get("businessId") or "") != str(payload["business_id"]):
+    if not isinstance(created, dict) or not pos_outlet_id or created.get("id") != pos_outlet_id or str(created.get("business_id") or created.get("businessId") or "") != str(payload["business_id"]) or str(created.get("tenant_id") or created.get("tenantId") or "") != str(payload["tenant_id"]):
         raise HTTPException(status_code=502, detail={"code": "POS_OUTLET_SCOPE_MISMATCH", "message": "POS returned an unverified default outlet identity"})
     if pos_outlet_id:
         await db.outlets.update_one(
@@ -4837,6 +4863,8 @@ async def process_pos_change(resource, business_id, event=None):
     result = await sync_pos_bridge_resource_for_system(resource, business_id, user)
     if result.get("error_count") or result.get("status") != "success":
         return result
+    if event and event.get("action") == "snapshot":
+        return result
     if event and event.get("action") == "deleted" and resource in set(POS_BRIDGE_RESOURCES) - {"businesses", "staff-shifts"}:
         external_id = event["record_id"]
         # A delayed delete must not remove a record that currently exists in POS.
@@ -4862,52 +4890,27 @@ async def process_pos_change(resource, business_id, event=None):
 pos_sync_worker = PosSyncWorker(db.pos_change_jobs, process_pos_change)
 
 @pos_bridge_router.get("/change-jobs")
-async def list_pos_change_jobs(request: Request, business_id: Optional[str] = Query(None)):
+async def list_pos_change_jobs(request: Request, business_id: Optional[str] = Query(None), snapshots_only: bool = Query(False)):
     user = await get_current_user(request)
     await require_pos_bridge_access(user, business_id)
     scope = await pos_business_filter(user, business_id)
+    if snapshots_only:
+        scope["event.action"] = "snapshot"
     return await db.pos_change_jobs.find(scope, {"_id": 0, "lease": 0}).sort("created_at", -1).limit(100).to_list(100)
 
-@pos_bridge_router.post("/sync-all")
+@pos_bridge_router.post("/sync-all", status_code=202)
 async def sync_all_pos_bridge_resources(request: Request, business_id: Optional[str] = Query(None)):
     user = await get_current_user(request)
-    if not business_id and user.get("role") != "platform_admin":
+    if not business_id:
         raise HTTPException(status_code=400, detail="business_id is required for POS bridge sync")
     await validate_pos_admin_business(user, business_id)
     await require_pos_bridge_access(user, business_id)
-
-    async def sync_one(resource: str):
-        try:
-            result = await asyncio.wait_for(
-                sync_pos_bridge_resource_for_system(resource, business_id, user),
-                timeout=POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS,
-            )
-            return resource, result
-        except asyncio.TimeoutError:
-            now_ts = datetime.now(timezone.utc).isoformat()
-            errors = [{
-                "resource": resource,
-                "reason": f"Timed out after {POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS} seconds",
-                "detail": {
-                    "code": "POS_BRIDGE_RESOURCE_TIMEOUT",
-                    "resource": resource,
-                    "timeout_seconds": POS_BRIDGE_RESOURCE_TIMEOUT_SECONDS,
-                },
-            }]
-            sync_run = await record_pos_bridge_sync_run(resource, business_id, user, "failed", 0, 1, errors, now_ts)
-            return resource, {"resource": resource, "status": "failed", "count": 0, "error_count": 1, "errors": errors, "sync_run": sync_run}
-        except HTTPException as exc:
-            detail = compact_bridge_error_detail(exc.detail)
-            detail.setdefault("status_code", exc.status_code)
-            return resource, {"resource": resource, "status": "failed", "count": 0, "error_count": 1, "errors": [{"reason": bridge_error_message(detail), "detail": detail}]}
-        except Exception as exc:
-            logger.exception("POS Sync All failed for %s", resource)
-            return resource, {"resource": resource, "status": "failed", "count": 0, "error_count": 1, "errors": [{"reason": "Internal synchronization error", "detail": {"status_code": 500}}]}
-
-    if pos_sync_all_lock.locked():
-        raise HTTPException(status_code=409, detail={"code": "POS_SYNC_ALREADY_RUNNING", "message": "Sync All is already running. Check sync health before retrying."})
-    async with pos_sync_all_lock:
-        return await run_sync_batch(POS_BRIDGE_RESOURCES, sync_one, timeout_seconds=POS_SYNC_ALL_TIMEOUT_SECONDS)
+    await pos_headers_for_admin_business(business_id)
+    results = {}
+    for resource in POS_BRIDGE_RESOURCES:
+        job = await pos_sync_worker.enqueue_snapshot(resource, business_id)
+        results[resource] = {"resource": resource, "job_id": job["id"], "status": job["status"]}
+    return {"status": "queued", "business_id": business_id, "results": results}
 
 
 # ===================================================================

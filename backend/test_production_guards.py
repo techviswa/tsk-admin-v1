@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 # Keep this suite independent of developer credentials and database availability.
 with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME": "admincore_guard_tests"}):
@@ -9,6 +9,68 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sync_all_queues_every_resource_without_calling_pos(self):
+        async def enqueue(resource, business_id):
+            return {"id": f"pos-snapshot:{business_id}:{resource}", "status": "pending"}
+        with patch.object(server, "get_current_user", new_callable=AsyncMock, return_value={"role": "platform_admin"}), \
+             patch.object(server, "validate_pos_admin_business", new_callable=AsyncMock), \
+             patch.object(server, "require_pos_bridge_access", new_callable=AsyncMock), \
+             patch.object(server, "pos_headers_for_admin_business", new_callable=AsyncMock), \
+             patch.object(server.pos_sync_worker, "enqueue_snapshot", new_callable=AsyncMock, side_effect=enqueue) as queue, \
+             patch.object(server, "sync_pos_bridge_resource_for_system", new_callable=AsyncMock) as sync:
+            with self.assertRaises(server.HTTPException):
+                await server.sync_all_pos_bridge_resources(None, None)
+            result = await server.sync_all_pos_bridge_resources(None, "a")
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(set(result["results"]), set(server.POS_BRIDGE_RESOURCES))
+        self.assertEqual(queue.await_count, len(server.POS_BRIDGE_RESOURCES))
+        sync.assert_not_awaited()
+
+    async def test_snapshot_does_not_repeat_dependency_exports(self):
+        with patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={}), \
+             patch.object(server, "sync_pos_bridge_resource_for_system", new_callable=AsyncMock, return_value={"status": "success"}) as sync:
+            await server.process_pos_change("bills", "a", {"action": "snapshot"})
+        sync.assert_awaited_once_with("bills", "a", {})
+
+    async def test_unprovisioned_scope_is_not_fabricated(self):
+        businesses = SimpleNamespace(find_one=AsyncMock(return_value={"id": "a"}), update_one=AsyncMock())
+        with patch.object(server, "db", SimpleNamespace(businesses=businesses)):
+            with self.assertRaises(server.HTTPException) as raised:
+                await server.pos_headers_for_admin_business("a")
+        self.assertEqual(raised.exception.status_code, 409)
+        businesses.update_one.assert_not_awaited()
+
+    async def test_linked_writes_skip_export_and_validate_response_scope(self):
+        headers = {"business_id": "pos-a", "tenant_id": "tenant-a", "x-tenant-id": "tenant-a"}
+        for resource, push in [("products", server.push_admin_product_to_pos), ("outlets", server.push_admin_outlet_to_pos)]:
+            for returned_tenant in ["tenant-a", "other-tenant"]:
+                collection = SimpleNamespace(update_one=AsyncMock())
+                database = SimpleNamespace(**{resource: collection})
+                record = {"id": "local", "business_id": "a", "name": "item", "pos_external_id": "pos-item", "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a"}
+                response = {"data": {"id": "pos-item", "business_id": "pos-a", "tenant_id": returned_tenant}}
+                with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
+                     patch.object(server, "pos_headers_for_admin_business", new_callable=AsyncMock, return_value=headers), \
+                     patch.object(server, "pos_bridge_request", new_callable=AsyncMock) as export, \
+                     patch.object(server, "pos_core_session_request", new_callable=AsyncMock, return_value=response) as write:
+                    if returned_tenant == "tenant-a":
+                        await push(record)
+                        collection.update_one.assert_awaited_once()
+                    else:
+                        with self.assertRaises(server.HTTPException):
+                            await push(record)
+                        collection.update_one.assert_not_awaited()
+                    export.assert_not_awaited()
+                    self.assertEqual(write.call_args.args[:2], ("PUT", f"admincore/{resource}/pos-item"))
+
+    def test_request_gate_blocks_calls_after_first_rate_limit(self):
+        session = SimpleNamespace(request=Mock(return_value=SimpleNamespace(status_code=429, headers={"Retry-After": "30"})))
+        with patch.object(server, "POS_CORE_RATE_LIMIT_UNTIL", 0), patch.object(server, "pos_next_request_at", 0):
+            for _ in range(2):
+                with self.assertRaises(server.HTTPException) as raised:
+                    server.send_pos_request(session, "GET", "https://pos.invalid/api/products")
+                self.assertEqual(raised.exception.status_code, 429)
+        session.request.assert_called_once()
+
     def test_rate_limit_respects_pos_retry_after(self):
         with patch.object(server, "POS_CORE_RATE_LIMIT_UNTIL", 0), patch.object(server.time, "time", return_value=100):
             self.assertEqual(server.mark_pos_rate_limited(SimpleNamespace(headers={"Retry-After": "12"})), 12)

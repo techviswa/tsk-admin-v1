@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -42,6 +42,8 @@ function errorText(error) {
 
 export default function POSBridgePage() {
   const { selectedBusiness } = useBusiness();
+  const activeBusinessId = useRef(selectedBusiness?.id);
+  activeBusinessId.current = selectedBusiness?.id;
   const [config, setConfig] = useState(null);
   const [resources, setResources] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -49,25 +51,50 @@ export default function POSBridgePage() {
   const [lastResult, setLastResult] = useState(null);
   const [previewing, setPreviewing] = useState('');
   const [livePreview, setLivePreview] = useState(null);
+  const [queuedJobs, setQueuedJobs] = useState([]);
+  const queueActive = queuedJobs.some(job => ['pending', 'retrying', 'running'].includes(job.status));
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      const [{ data: bridgeConfig }, { data: bridgeResources }] = await Promise.all([
+      const [{ data: bridgeConfig }, { data: bridgeResources }, { data: jobs }] = await Promise.all([
         api.get('/pos-bridge/config'),
         api.get('/pos-bridge/resources', { params }),
+        selectedBusiness ? api.get('/pos-bridge/change-jobs', { params: { ...params, snapshots_only: true } }) : Promise.resolve({ data: [] }),
       ]);
+      if (activeBusinessId.current !== selectedBusiness?.id) return;
       setConfig(bridgeConfig);
       setResources(bridgeResources);
+      const snapshots = jobs.filter(job => job.id.startsWith('pos-snapshot:'));
+      setQueuedJobs(snapshots);
+      if (snapshots.length) {
+        setLastResult({ results: Object.fromEntries(snapshots.map(job => [job.resource, {
+          resource: job.resource,
+          status: job.status === 'synced' ? 'success' : job.status,
+          count: job.result?.count || 0,
+          run_after: job.run_after,
+          errors: job.last_error ? (Array.isArray(job.last_error) ? job.last_error : [job.last_error]) : [],
+          error_count: job.last_error ? 1 : 0,
+        }])) });
+      }
     } catch (err) {
-      toast.error(formatApiError(err));
+      if (activeBusinessId.current === selectedBusiness?.id) toast.error(formatApiError(err));
     } finally {
-      setLoading(false);
+      if (activeBusinessId.current === selectedBusiness?.id) setLoading(false);
     }
   }, [selectedBusiness]);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    setLastResult(null);
+    setQueuedJobs([]);
+  }, [selectedBusiness?.id]);
+  useEffect(() => {
+    if (!queueActive) return undefined;
+    const timer = setInterval(() => load(true), 10000);
+    return () => clearInterval(timer);
+  }, [load, queueActive]);
 
   const syncResource = async (resource) => {
     setSyncing(resource);
@@ -92,7 +119,8 @@ export default function POSBridgePage() {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
       const { data } = await api.post('/pos-bridge/sync-all', null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
       setLastResult(data);
-      if (data.status === 'success') toast.success('POS bridge sync completed');
+      if (data.status === 'queued') toast.success('POS sync queued');
+      else if (data.status === 'success') toast.success('POS bridge sync completed');
       else toast.error(`POS sync incomplete. ${data.skipped_count || 0} resources skipped; review the results and retry.`);
       await load();
     } catch (err) {
@@ -142,10 +170,10 @@ export default function POSBridgePage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" onClick={load} disabled={loading} className="gap-1.5">
+          <Button variant="outline" size="sm" onClick={() => load()} disabled={loading} className="gap-1.5">
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />Refresh
           </Button>
-          <Button size="sm" onClick={syncAll} disabled={!config?.configured || Boolean(syncing)} className="gap-1.5 bg-blue-600 hover:bg-blue-700">
+          <Button size="sm" onClick={syncAll} disabled={!selectedBusiness || !config?.configured || Boolean(syncing) || queueActive} className="gap-1.5 bg-blue-600 hover:bg-blue-700">
             <RotateCw className={`h-3.5 w-3.5 ${syncing.startsWith('all') ? 'animate-spin' : ''}`} />Sync All
           </Button>
         </div>
@@ -238,7 +266,7 @@ export default function POSBridgePage() {
                         variant="outline"
                         size="sm"
                         className="h-8 gap-1.5 border-zinc-200"
-                        disabled={!config?.configured || Boolean(previewing)}
+                        disabled={!selectedBusiness || !config?.configured || Boolean(previewing)}
                         onClick={() => viewLiveResource(resource)}
                       >
                         <Eye className={`h-3.5 w-3.5 ${previewing === resource.key ? 'animate-pulse' : ''}`} />Live
@@ -247,7 +275,7 @@ export default function POSBridgePage() {
                         variant="outline"
                         size="sm"
                         className="h-8 gap-1.5 border-zinc-200"
-                        disabled={!config?.configured || Boolean(syncing)}
+                        disabled={!selectedBusiness || !config?.configured || Boolean(syncing) || queueActive}
                         onClick={() => syncResource(resource.key)}
                       >
                         <RotateCw className={`h-3.5 w-3.5 ${syncing === resource.key || syncing === `all:${resource.key}` ? 'animate-spin' : ''}`} />Sync
@@ -279,6 +307,7 @@ export default function POSBridgePage() {
                   <div className="mt-2 text-xs text-zinc-500">
                     {row.count || 0} synced, {row.error_count || 0} errors
                   </div>
+                  {row.status === 'retrying' && <p className="mt-2 text-xs text-amber-700">Next attempt: {formatSyncTime(row.run_after)}</p>}
                   {(row.errors || []).length > 0 && (
                     <p className="mt-2 text-xs text-red-600 line-clamp-2" title={errorText(row.errors[0])}>
                       {errorText(row.errors[0])}
