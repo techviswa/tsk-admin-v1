@@ -33,11 +33,10 @@ Updated: 2026-09-10. This is a continuation record, not a production sign-off.
 
 ## Still open, in priority order
 
-1. Durable outbound user/profile updates. update_user still performs POS writes
-   before committing AdminCore edits. Partial success across businesses needs
-   persisted per-business progress and conflict handling. Passwords must remain
-   hashed in any durable job, with no hashes exposed through job/status APIs.
-2. Provisioning step recovery and authenticated tests against the deployed POS:
+1. Live verification of the implemented durable profile recovery. Conflicting
+   concurrent edits currently fail explicitly and require reconciliation; they
+   are not silently overwritten. Status APIs omit stored credential hashes.
+2. Live verification of provisioning step recovery against the deployed POS:
    business, owner, outlet, returned IDs, owner login, and a recoverable failed step.
 3. Verify products, bills, payments, customers, inventory, reports, and staff for
    at least two isolated businesses, including edits, deletions, and replayed events.
@@ -49,7 +48,38 @@ Updated: 2026-09-10. This is a continuation record, not a production sign-off.
    regression tests. Current unit tests are not a full production audit.
 7. Verify the deployed AdminCore/POS/frontend commits, Render logs, CORS/env, database
    indexes/backups, and authenticated UI workflows. Render credentials and current
-   production application credentials are not available in this session.
+   production application credentials require explicit approval before use.
 
 Do not report any open item as completed based only on a build, a readiness
 response, or a queued-status toast.
+
+## Recovery follow-up
+
+Implemented after the initial batch:
+
+- Profile edits are durably queued with hashed credentials and per-business
+  checkpoints. AdminCore applies the requested profile after POS steps complete.
+  Retries skip completed businesses; conflicting later profile edits fail explicitly.
+- Removed business assignments deactivate the corresponding POS account. Editing
+  within a selected business preserves the user's other memberships.
+- User rows display pending/retrying/failed state. Sync to POS retries failed jobs.
+- Provisioning persists tenant/owner checkpoints, rejects overlapping jobs, bounds
+  worker execution, fences job updates with a lease, and handles final-attempt crashes.
+- Provisioning verifies the owner's link for the specific business, rather than
+  trusting a global POS user ID that may belong to another business.
+- Authenticated HTTP tests use real JWT validation with fixture data: both business
+  owners are denied the other's exports and sync requests; wrong-tenant exports
+  are rejected. These are not authenticated tests against production databases.
+- CI installs test dependencies and includes profile recovery tests.
+- Public health now includes the Render commit revision for deployment verification.
+
+Verification: 34 production/authenticated tests and 14 POS recovery/sync tests pass.
+The final frontend production rebuild passed.
+
+Public deployment evidence: Vercel reported success for the prior 6bdd30b commit.
+AdminCore health responded successfully but reports production_config_ok=false:
+"Replace the development POS bridge key in both production services".
+This requires matching production keys in the Render configuration of both services.
+Local login credentials were found. Automatic approval review blocked using them
+at the deployed login URL pending explicit user approval. No credentialed production
+check has been performed in this follow-up yet.

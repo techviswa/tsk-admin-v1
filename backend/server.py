@@ -26,11 +26,13 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from pydantic import BaseModel
-from pymongo.errors import PyMongoError
+from pymongo import ReturnDocument
+from pymongo.errors import PyMongoError, DuplicateKeyError
 import bcrypt
 import jwt as pyjwt
 import qrcode
 from pos_sync_worker import PosSyncWorker
+from pos_profile_updates import PosProfileUpdates
 from pos_retry import retry_after_seconds, rate_limit_delay
 from production_config import validate_production_config
 
@@ -80,6 +82,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "admincore",
+        "revision": os.environ.get("RENDER_GIT_COMMIT", "local"),
         "time": datetime.now(timezone.utc).isoformat(),
         "pos_configured": bool(POS_CORE_API_BASE_URL),
         "production_config_ok": PRODUCTION_CONFIG_STATUS.get("ok", True),
@@ -378,11 +381,17 @@ async def queue_pos_provisioning_job(
         "created_at": now_ts,
         "updated_at": now_ts,
     }
-    await db.pos_provisioning_jobs.update_many(
-        {"business_id": business_id, "status": {"$in": ["pending", "retrying"]}},
-        {"$set": {"status": "superseded", "updated_at": now_ts}},
-    )
-    await db.pos_provisioning_jobs.insert_one(job)
+    active = await db.pos_provisioning_jobs.find_one({"business_id": business_id, "status": {"$in": ["pending", "retrying", "running"]}}, {"id": 1})
+    if active:
+        raise HTTPException(status_code=409, detail="POS provisioning is already queued or running for this business")
+    try:
+        await db.pos_provisioning_jobs.find_one_and_update(
+            {"_id": f"provision:{business_id}", "status": {"$nin": ["pending", "retrying", "running"]}},
+            {"$set": job, "$unset": {"steps": "", "lease": "", "result": "", "finished_at": ""}},
+            upsert=True, return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="POS provisioning is already queued or running for this business") from exc
     await mark_business_pos_status(
         business_id,
         "pending",
@@ -400,23 +409,35 @@ async def run_pos_provisioning_job(job: dict):
         "id": job.get("actor_id") or "system",
         "email": job.get("actor_email") or "system",
     }
+    lease = secrets.token_hex(16)
+    job_filter = {"id": job["id"], "lease": lease}
     claim = await db.pos_provisioning_jobs.update_one(
         {"id": job["id"], "status": {"$in": ["pending", "retrying"]}, "attempts": attempts - 1},
-        {"$set": {"status": "running", "attempts": attempts, "last_attempt_at": now_ts, "updated_at": now_ts}},
+        {"$set": {"status": "running", "lease": lease, "attempts": attempts, "last_attempt_at": now_ts, "updated_at": now_ts}},
     )
     if not claim.modified_count:
         return
+    async def checkpoint(step, value):
+        saved = await db.pos_provisioning_jobs.update_one(job_filter, {"$set": {f"steps.{step}": value}})
+        if not saved.matched_count:
+            raise HTTPException(status_code=409, detail="Provisioning job lease was replaced")
     try:
-        result = await provision_business_end_to_end(
+        if attempts > int(job.get("max_attempts") or POS_PROVISIONING_MAX_ATTEMPTS):
+            raise HTTPException(status_code=503, detail="Provisioning retry limit reached after worker restart")
+        result = await asyncio.wait_for(provision_business_end_to_end(
             business_id,
             owner_name=job.get("owner_name"),
             owner_email=job.get("owner_email"),
             owner_password=job.get("owner_password"),
             actor=actor,
             enqueue_on_failure=False,
-        )
+            steps=job.get("steps", {}),
+            checkpoint=checkpoint,
+        ), timeout=300)
+        if not result.get("configured"):
+            raise HTTPException(status_code=503, detail="POS bridge is not configured")
         await db.pos_provisioning_jobs.update_one(
-            {"id": job["id"]},
+            job_filter,
             {"$set": {"status": "synced", "result": result, "owner_password": "", "finished_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}},
         )
     except Exception as exc:
@@ -436,8 +457,9 @@ async def run_pos_provisioning_job(job: dict):
         else:
             update["owner_password"] = ""
             update["finished_at"] = datetime.now(timezone.utc).isoformat()
-        await db.pos_provisioning_jobs.update_one({"id": job["id"]}, {"$set": update})
-        await mark_business_pos_status(business_id, "failed" if status == "failed" else "pending", detail)
+        saved = await db.pos_provisioning_jobs.update_one(job_filter, {"$set": update})
+        if saved.matched_count:
+            await mark_business_pos_status(business_id, "failed" if status == "failed" else "pending", detail)
 
 async def process_due_pos_provisioning_jobs(limit: int = 1):
     if pos_rate_limit_seconds_remaining() > 0:
@@ -452,7 +474,6 @@ async def process_due_pos_provisioning_jobs(limit: int = 1):
         {
             "status": {"$in": ["pending", "retrying"]},
             "run_after": {"$lte": now_ts},
-            "attempts": {"$lt": POS_PROVISIONING_MAX_ATTEMPTS},
         },
         {"_id": 0},
     ).sort("created_at", 1).limit(limit)
@@ -512,13 +533,23 @@ async def provision_business_end_to_end(
     owner_password: Optional[str] = None,
     actor: Optional[dict] = None,
     enqueue_on_failure: bool = True,
+    steps: Optional[dict] = None,
+    checkpoint=None,
 ) -> dict:
     if not POS_CORE_API_BASE_URL:
         await mark_business_pos_status(business_id, "not_configured")
         return {"configured": False, "message": "POS bridge is not configured"}
     await mark_business_pos_status(business_id, "pending")
+    steps = dict(steps or {})
+    async def record_step(name, value):
+        if checkpoint:
+            await checkpoint(name, value)
+        steps[name] = value
     try:
-        provisioned = await provision_admin_business_to_pos(business_id)
+        provisioned = steps.get("business")
+        if not provisioned:
+            provisioned = await provision_admin_business_to_pos(business_id)
+            await record_step("business", provisioned)
         business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
         owner = await ensure_business_owner_user(
             business_id,
@@ -528,7 +559,9 @@ async def provision_business_end_to_end(
         )
         if not owner:
             raise HTTPException(status_code=400, detail="Business owner email and password are required before POS provisioning can complete")
-        await push_admin_user_to_pos(owner, owner_password, allow_generated_password=False, target_business_id=business_id)
+        if steps.get("owner_id") != owner["id"]:
+            await push_admin_user_to_pos(owner, owner_password, allow_generated_password=False, target_business_id=business_id)
+            await record_step("owner_id", owner["id"])
         outlet = await ensure_default_outlet_for_business(
             business_id,
             user=actor,
@@ -539,7 +572,10 @@ async def provision_business_end_to_end(
         if not outlet or not outlet.get("pos_external_id") or not outlet.get("pos_synced"):
             raise HTTPException(status_code=502, detail="POS default outlet identity was not verified")
         verified_owner = await db.users.find_one({"id": owner["id"]}, {"_id": 0})
-        if not verified_owner or not verified_owner.get("pos_external_id") or not verified_owner.get("pos_synced"):
+        owner_link = ((verified_owner or {}).get("pos_links") or {}).get(business_id, {})
+        if (not verified_owner or not owner_link.get("user_id")
+                or owner_link.get("business_id") != provisioned.get("business_id")
+                or owner_link.get("tenant_id") != provisioned.get("tenant_id")):
             raise HTTPException(status_code=502, detail="POS owner identity was not verified")
         await mark_business_pos_status(
             business_id,
@@ -547,7 +583,7 @@ async def provision_business_end_to_end(
             extra={
                 "pos_synced_at": datetime.now(timezone.utc).isoformat(),
                 "pos_owner_email": owner.get("email", ""),
-                "pos_owner_id": verified_owner["pos_external_id"],
+                "pos_owner_id": owner_link["user_id"],
                 "pos_default_outlet_id": outlet["pos_external_id"],
             },
         )
@@ -2269,6 +2305,14 @@ async def list_users(request: Request, business_id: Optional[str] = Query(None))
         bid = business_id or (user.get("business_ids", [""])[0] if user.get("business_ids") else "")
         query = {"business_ids": bid} if bid else {}
     users = await db.users.find(query, {"_id": 0, "password_hash": 0}).to_list(200)
+    jobs = await db.pos_profile_jobs.find({"_id": {"$in": [row["id"] for row in users]}},
+                                          {"_id": 1, "status": 1, "run_after": 1, "last_error": 1}).to_list(200)
+    status_by_user = {job["_id"]: job for job in jobs}
+    for row in users:
+        job = status_by_user.get(row["id"], {})
+        row["pos_update_status"] = job.get("status")
+        row["pos_update_retry_at"] = job.get("run_after")
+        row["pos_update_error"] = bridge_error_message(job["last_error"])[:300] if job.get("last_error") else ""
     return users
 
 @user_router.post("")
@@ -2305,13 +2349,15 @@ async def create_user(data: UserCreate, request: Request):
     return created
 
 @user_router.put("/{user_id}")
-async def update_user(user_id: str, data: UserUpdate, request: Request):
+async def update_user(user_id: str, data: UserUpdate, request: Request, response: Response):
     user = await get_current_user(request)
     if user["role"] not in ["platform_admin", "business_owner"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     existing = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
+    if user["role"] != "platform_admin" and (existing.get("role") in {"platform_admin", "support_admin"} or not existing.get("business_ids")):
+        raise HTTPException(status_code=403, detail="Only platform admins can edit platform accounts")
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
     if "email" in update_data:
         email = (update_data["email"] or "").strip().lower()
@@ -2346,6 +2392,10 @@ async def update_user(user_id: str, data: UserUpdate, request: Request):
         await require_business_module_enabled(business_id, CORE_FEATURE_MODULES["users"])
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     updated_user = {**existing, **update_data}
+    if POS_CORE_API_BASE_URL and (updated_user.get("business_ids") or existing.get("business_ids")):
+        await pos_profile_updates.enqueue(existing, update_data, data.password, user)
+        response.status_code = 202
+        return {**{k: v for k, v in existing.items() if k not in {"_id", "password_hash"}}, "pos_update_status": "pending"}
     pos_push = []
     try:
         for target_business_id in updated_user.get("business_ids", []):
@@ -2378,7 +2428,13 @@ async def sync_user_to_pos(user_id: str, request: Request):
         if not allowed_business_ids.intersection(set(target_user.get("business_ids", []))):
             raise HTTPException(status_code=403, detail="Access denied")
     for business_id in target_user.get("business_ids", []):
+        await validate_business_access(user, business_id)
         await require_business_module_enabled(business_id, CORE_FEATURE_MODULES["users"])
+    job = await db.pos_profile_jobs.find_one({"_id": user_id}, {"status": 1})
+    if job and job.get("status") in {"pending", "running", "retrying", "failed"}:
+        await db.pos_profile_jobs.update_one({"_id": user_id, "status": "failed"},
+                                              {"$set": {"status": "retrying", "attempts": 0, "run_after": datetime.now(timezone.utc).isoformat()}})
+        return {"message": "POS profile update queued", "status": "pending"}
     result = await push_admin_user_to_pos(target_user)
     if not result:
         raise HTTPException(status_code=400, detail="User is not assigned to a POS-syncable business")
@@ -4083,6 +4139,10 @@ async def push_admin_user_to_pos(user_doc: dict, password: Optional[str] = None,
             existing_pos_user_id = matches[0].get("id")
             if not existing_pos_user_id:
                 raise HTTPException(status_code=502, detail="POS staff export omitted the user ID")
+            # Persist the verified identity before an email change can hide it from retries.
+            await db.users.update_one({"id": user_doc["id"]}, {"$set": {
+                f"pos_links.{business_id}": {"user_id": existing_pos_user_id, "business_id": pos_business_id, "tenant_id": pos_tenant_id},
+            }})
     payload = {
         "name": user_doc.get("name") or user_doc["email"].split("@")[0],
         "email": user_doc["email"],
@@ -4888,6 +4948,7 @@ async def process_pos_change(resource, business_id, event=None):
     return result
 
 pos_sync_worker = PosSyncWorker(db.pos_change_jobs, process_pos_change)
+pos_profile_updates = PosProfileUpdates(db, push_admin_user_to_pos, create_audit_log)
 
 @pos_bridge_router.get("/change-jobs")
 async def list_pos_change_jobs(request: Request, business_id: Optional[str] = Query(None), snapshots_only: bool = Query(False)):
@@ -5394,6 +5455,7 @@ async def run_startup_maintenance():
     await db.pos_bridge_sync_runs.create_index([("resource", 1), ("business_id", 1), ("created_at", -1)])
     await db.pos_bridge_sync_runs.create_index("status")
     await db.pos_provisioning_jobs.create_index("id", unique=True)
+    await db.pos_profile_jobs.create_index([("status", 1), ("run_after", 1)])
     await db.pos_provisioning_jobs.create_index([("status", 1), ("run_after", 1)])
     await db.pos_provisioning_jobs.create_index([("business_id", 1), ("created_at", -1)])
     for config in POS_ADMIN_RESOURCES.values():
@@ -5424,6 +5486,7 @@ async def startup():
     if POS_PROVISIONING_WORKER_ENABLED:
         asyncio.create_task(pos_provisioning_worker())
     asyncio.create_task(pos_sync_worker.run_forever())
+    asyncio.create_task(pos_profile_updates.worker.run_forever())
     logger.info("AdminCore API startup ready")
 
 

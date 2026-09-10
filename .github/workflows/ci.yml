@@ -40,7 +40,7 @@ jobs:
 
       - name: Install backend dependencies
         working-directory: backend
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-test.txt
 
       - name: Compile backend
         run: python -m py_compile backend/server.py backend/test_entitlements.py
@@ -49,7 +49,7 @@ jobs:
         run: python backend/test_entitlements.py
 
       - name: Run sync reliability tests
-        run: python -m unittest discover -s backend -p "test_pos_sync_*.py"
+        run: python -m unittest discover -s backend -p "test_pos_*.py"
 
       - name: Run production guards
         run: python -m unittest discover -s backend -p "test_production_*.py"

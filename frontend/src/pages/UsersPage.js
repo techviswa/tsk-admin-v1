@@ -48,6 +48,12 @@ export default function UsersPage() {
   }, [selectedBusiness]);
 
   useEffect(() => { setLoading(true); fetchUsers(); }, [fetchUsers]);
+  const hasPendingUpdates = users.some(u => ['pending', 'running', 'retrying'].includes(u.pos_update_status));
+  useEffect(() => {
+    if (!hasPendingUpdates) return undefined;
+    const timer = setInterval(fetchUsers, 10000);
+    return () => clearInterval(timer);
+  }, [fetchUsers, hasPendingUpdates]);
 
   const openCreate = () => {
     setEditing(null);
@@ -74,12 +80,13 @@ export default function UsersPage() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      const scopedBusinessIds = selectedBusiness ? [selectedBusiness.id] : form.business_ids;
+      const scopedBusinessIds = selectedBusiness ? (editing?.business_ids || [selectedBusiness.id]) : form.business_ids;
       if (editing) {
         const updateData = { name: form.name, email: form.email, role: form.role, status: form.status, business_ids: scopedBusinessIds };
         if (form.password) updateData.password = form.password;
-        await api.put(`/users/${editing.id}`, updateData);
-        toast.success('User updated');
+        const { data } = await api.put(`/users/${editing.id}`, updateData);
+        if (data.pos_update_status === 'pending') toast.success('Profile update queued; changes are pending');
+        else toast.success('User updated');
       } else {
         const createData = { ...form, business_ids: scopedBusinessIds };
         delete createData.status;
@@ -102,8 +109,8 @@ export default function UsersPage() {
 
   const handleSyncToPOS = async (u) => {
     try {
-      await api.post(`/users/${u.id}/sync-pos`);
-      toast.success('User synced to POS');
+      const { data } = await api.post(`/users/${u.id}/sync-pos`);
+      toast.success(data.status === 'pending' ? 'Profile update queued' : 'User synced to POS');
       fetchUsers();
     } catch (err) { toast.error(`POS sync failed: ${formatApiError(err)}`); }
   };
@@ -158,6 +165,11 @@ export default function UsersPage() {
                   <Badge className={`text-[11px] ${STATUS_COLORS[u.status] || STATUS_COLORS.inactive}`}>
                     {u.status}
                   </Badge>
+                  {u.pos_update_status && u.pos_update_status !== 'synced' && (
+                    <div className="mt-1 text-xs text-amber-700" title={u.pos_update_error || (u.pos_update_retry_at ? `Next attempt: ${new Date(u.pos_update_retry_at).toLocaleString()}` : undefined)}>
+                      POS update: {u.pos_update_status}
+                    </div>
+                  )}
                 </TableCell>
                 <TableCell className="py-3">
                   {u.id !== currentUser?.id && (
