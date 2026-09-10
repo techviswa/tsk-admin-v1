@@ -106,6 +106,12 @@ poll pending work, and ignore stale responses after business/resource navigation
 The live verification script reports only statuses, counts, and scope mismatches;
 it does not print credentials, tokens, or records.
 
+User creation now follows the durable profile workflow as well. AdminCore keeps
+the new user, returns HTTP 202 with pending status, stores the POS-compatible
+password only as a hash, and lets the worker resume each unfinished business after
+rate limits or outages. It no longer calls POS inline or deletes the AdminCore user
+when POS returns 429. The UI reports "User created; POS sync queued".
+
 The remaining deployment configuration blocker is unchanged: AdminCore health
 reports production_config_ok=false because both services still use the development
 bridge key. No Render API credential or connector is available in this workspace,

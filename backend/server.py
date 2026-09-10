@@ -2316,7 +2316,7 @@ async def list_users(request: Request, business_id: Optional[str] = Query(None))
     return users
 
 @user_router.post("")
-async def create_user(data: UserCreate, request: Request):
+async def create_user(data: UserCreate, request: Request, response: Response):
     user = await get_current_user(request)
     if user["role"] not in ["platform_admin", "business_owner", "manager"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -2335,17 +2335,21 @@ async def create_user(data: UserCreate, request: Request):
     user_id = str(ObjectId())
     doc = {"id": user_id, "email": email, "password_hash": hash_password(data.password), "name": data.name, "role": data.role, "business_ids": business_ids, "status": "active", "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}
     await db.users.insert_one(doc)
-    pos_push = None
-    try:
-        pos_push = await push_admin_user_to_pos({k: v for k, v in doc.items() if k != "password_hash"}, data.password)
-    except HTTPException as exc:
-        logger.warning("Could not push AdminCore user to POS: %s", exc.detail)
-        if POS_CORE_API_BASE_URL and business_ids:
+    queued = False
+    if POS_CORE_API_BASE_URL and business_ids:
+        try:
+            await pos_profile_updates.enqueue(doc, {}, data.password, user, operation="create")
+            queued = True
+            response.status_code = 202
+        except Exception:
+            # No POS request has run yet, so removing this incomplete local insert is safe.
             await db.users.delete_one({"id": user_id})
-            raise HTTPException(status_code=502, detail=f"User was not created because POS sync failed: {exc.detail}")
+            raise
     biz_id = data.business_ids[0] if data.business_ids else None
-    await create_audit_log(biz_id, user["id"], user["email"], "created", "user", user_id, {"email": email, "role": data.role, "pos_pushed": bool(pos_push)})
+    await create_audit_log(biz_id, user["id"], user["email"], "created", "user", user_id, {"email": email, "role": data.role, "pos_update_status": "pending" if queued else "not_configured"})
     created = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    if queued:
+        created["pos_update_status"] = "pending"
     return created
 
 @user_router.put("/{user_id}")

@@ -10,6 +10,28 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class AuthenticatedSyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_creation_is_accepted_and_queued_without_pos_call(self):
+        account = {"id": "admin", "role": "platform_admin", "email": "admin@example.test"}
+        users = SimpleNamespace(find_one=AsyncMock(side_effect=[account, None, {"id": "staff", "email": "staff@example.test"}]),
+                                insert_one=AsyncMock(), count_documents=AsyncMock(return_value=0), delete_one=AsyncMock())
+        database = SimpleNamespace(users=users, businesses=SimpleNamespace(find_one=AsyncMock(return_value={"id": "a"})))
+        with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
+             patch.object(server, "validate_client_business_ids", new_callable=AsyncMock), \
+             patch.object(server, "require_business_module_enabled", new_callable=AsyncMock), \
+             patch.object(server, "enforce_limit", new_callable=AsyncMock), \
+             patch.object(server, "create_audit_log", new_callable=AsyncMock), \
+             patch.object(server.pos_profile_updates, "enqueue", new_callable=AsyncMock) as enqueue, \
+             patch.object(server, "push_admin_user_to_pos", new_callable=AsyncMock) as push:
+            token = server.create_access_token(account["id"], account["email"])
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://test") as client:
+                result = await client.post("/api/users", json={"name": "Staff", "email": "staff@example.test", "password": "password123", "role": "staff", "business_ids": ["a"]}, headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(result.status_code, 202, result.text)
+        self.assertEqual(result.json()["pos_update_status"], "pending")
+        enqueue.assert_awaited_once()
+        self.assertEqual(enqueue.call_args.kwargs["operation"], "create")
+        push.assert_not_awaited()
+        users.delete_one.assert_not_awaited()
+
     async def test_authenticated_export_accepts_own_scope_and_rejects_wrong_scope(self):
         for own in ["a", "b"]:
             account = {"id": own, "email": f"{own}@example.test", "role": "business_owner", "business_ids": [own]}

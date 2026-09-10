@@ -17,9 +17,9 @@ class PosProfileUpdates:
         self.audit = audit
         self.worker = PosSyncWorker(self.jobs, self.process)
 
-    async def enqueue(self, existing, changes, password, actor):
+    async def enqueue(self, existing, changes, password, actor, operation="update"):
         user_id = existing["id"]
-        event = {"operation_id": str(uuid4()), "user_id": user_id,
+        event = {"operation_id": str(uuid4()), "operation": operation, "user_id": user_id,
                  "changes": changes, "baseline": {key: existing.get(key) for key in changes if key != "updated_at"},
                  "previous_email": existing.get("email"), "password": hash_pos_password(password),
                  "business_ids": changes.get("business_ids", existing.get("business_ids", [])),
@@ -78,5 +78,6 @@ class PosProfileUpdates:
                 {"$set": {"pos_owner_email": changes["email"]}},
             )
         await self.audit((event["business_ids"] or [None])[0], event["actor_id"], event["actor_email"],
-                         "updated", "user", user_id, {"pos_update_operation": event["operation_id"]})
+                         "synced", "user", user_id, {"pos_update_operation": event["operation_id"],
+                         "operation": event.get("operation", "update")})
         return {"status": "success", "user_id": user_id}

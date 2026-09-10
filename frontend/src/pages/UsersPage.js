@@ -90,8 +90,8 @@ export default function UsersPage() {
       } else {
         const createData = { ...form, business_ids: scopedBusinessIds };
         delete createData.status;
-        await api.post('/users', createData);
-        toast.success('User created');
+        const { data } = await api.post('/users', createData);
+        toast.success(data.pos_update_status === 'pending' ? 'User created; POS sync queued' : 'User created');
       }
       setSheetOpen(false);
       fetchUsers();
