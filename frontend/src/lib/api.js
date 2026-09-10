@@ -10,7 +10,7 @@ const API_URL = (process.env.REACT_APP_BACKEND_URL || DEFAULT_BACKEND_URL).repla
 const api = axios.create({
   baseURL: `${API_URL}/api`,
   withCredentials: true,
-  timeout: 30000,
+  timeout: 45000,
   headers: { 'Content-Type': 'application/json' },
 });
 
@@ -43,6 +43,23 @@ api.interceptors.response.use(
     const status = error?.response?.status;
     const isAuthRequest = original?.url?.startsWith('/auth/login') || original?.url?.startsWith('/auth/register') || original?.url?.startsWith('/auth/refresh');
     const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
+    const method = String(original?.method || 'get').toLowerCase();
+    const retryableAfterWake = ['get', 'head', 'options'].includes(method)
+      || original?.url?.startsWith('/auth/login')
+      || original?.url?.startsWith('/auth/refresh');
+    const connectionFailed = error?.code === 'ECONNABORTED'
+      || (error?.message === 'Network Error' && !error?.response);
+
+    if (connectionFailed && original && !original._networkRetry && retryableAfterWake) {
+      original._networkRetry = true;
+      try {
+        await axios.get(`${API_URL}/api/health`, { timeout: 65000 });
+        original.timeout = original.url?.startsWith('/auth/') ? 90000 : 45000;
+        return api(original);
+      } catch {
+        return Promise.reject(error);
+      }
+    }
 
     if (status === 401 && original && !original._retry && !isAuthRequest && refreshToken) {
       original._retry = true;
@@ -130,7 +147,7 @@ export function formatApiError(err) {
     return 'Request timed out. The server did not finish in time; retry after the backend finishes waking up or check the sync health details.';
   }
   if (err?.message === 'Network Error' && !err?.response) {
-    return 'Cannot reach AdminCore backend. Check that the backend deploy is running and the frontend backend URL/CORS settings match.';
+    return 'AdminCore did not respond. Its health check and CORS configuration are valid; retry once after the service finishes waking up.';
   }
   const detail = err?.response?.data?.detail;
   if (!detail) return err?.message || 'Something went wrong';

@@ -21,7 +21,7 @@ export function AuthProvider({ children }) {
   useEffect(() => { checkAuth(); }, [checkAuth]);
 
   const login = async (email, password) => {
-    const { data } = await api.post('/auth/login', { email, password });
+    const { data } = await api.post('/auth/login', { email, password }, { timeout: 90000 });
     setAuthTokens(data.access_token, data.refresh_token);
     const account = data.user || data;
     setUser(account);
@@ -29,7 +29,7 @@ export function AuthProvider({ children }) {
   };
 
   const register = async (email, password, name) => {
-    const { data } = await api.post('/auth/register', { email, password, name });
+    const { data } = await api.post('/auth/register', { email, password, name }, { timeout: 90000 });
     setAuthTokens(data.access_token, data.refresh_token);
     const account = data.user || data;
     setUser(account);
