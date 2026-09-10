@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
@@ -349,8 +349,10 @@ export default function POSAdminPage() {
   const [reportsSummary, setReportsSummary] = useState(null);
 
   const effectiveBusinessId = filters.business_id || selectedBusiness?.id || '';
+  const requestVersion = useRef(0);
 
   const fetchRecords = useCallback(async () => {
+    const version = ++requestVersion.current;
     setLoading(true);
     try {
       const params = {
@@ -362,15 +364,24 @@ export default function POSAdminPage() {
         date_to: filters.date_to || undefined,
       };
       const { data: result } = await api.get(`/pos-admin/${resource}`, { params });
-      setData(result);
+      if (version === requestVersion.current) setData(result);
     } catch (err) {
-      toast.error(formatApiError(err));
+      if (version === requestVersion.current) toast.error(formatApiError(err));
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
   }, [effectiveBusinessId, filters.date_from, filters.date_to, filters.outlet_id, filters.search, filters.status, resource]);
 
-  useEffect(() => { fetchRecords(); }, [fetchRecords]);
+  useEffect(() => {
+    fetchRecords();
+    return () => { requestVersion.current += 1; };
+  }, [fetchRecords]);
+  const refreshPending = ['pending', 'running', 'retrying'].includes(data?.refresh_job?.status);
+  useEffect(() => {
+    if (!refreshPending) return undefined;
+    const timer = setInterval(fetchRecords, 10000);
+    return () => clearInterval(timer);
+  }, [fetchRecords, refreshPending]);
 
   useEffect(() => {
     if (resource !== 'payments') {
@@ -630,6 +641,13 @@ export default function POSAdminPage() {
           <p className="text-sm text-zinc-500 mt-1">
             {selectedBusiness ? `${selectedBusiness.name} operations` : 'Platform-wide POS operations'}
           </p>
+          {data?.refresh_job && data.refresh_job.status !== 'synced' && (
+            <p className="mt-1 text-xs text-amber-700">
+              POS refresh: {data.refresh_job.status}
+              {data.refresh_job.status === 'retrying' && data.refresh_job.run_after
+                ? `; next attempt ${new Date(data.refresh_job.run_after).toLocaleString()}` : ''}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={fetchRecords} disabled={loading} className="gap-1.5">

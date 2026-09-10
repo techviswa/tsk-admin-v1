@@ -3060,19 +3060,10 @@ async def list_pos_admin_records(
 
     collection = db[config["collection"]]
     has_filters = bool(outlet_id or search or date_from or date_to or (status and status != "all"))
+    refresh_job = None
     if business_id and bridge_resource and not has_filters:
-        try:
-            await sync_pos_bridge_resource_for_system(bridge_resource, business_id, user)
-        except HTTPException as exc:
-            logger.warning("Could not auto-sync POS %s for business %s: %s", resource, business_id, exc.detail)
-            await db.businesses.update_one(
-                {"id": business_id},
-                {"$set": {
-                    "pos_last_sync_error": compact_bridge_error_detail(exc.detail),
-                    "pos_last_sync_error_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
+        job = await pos_sync_worker.enqueue_snapshot(bridge_resource, business_id, fresh_for_seconds=60)
+        refresh_job = {"id": job["id"], "status": job["status"], "run_after": job.get("run_after")}
     records = await collection.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
     total = await collection.count_documents(query)
     status_counts = []
@@ -3089,6 +3080,7 @@ async def list_pos_admin_records(
         "label": config["label"],
         "statuses": config["statuses"],
         "records": await decorate_pos_records(records),
+        "refresh_job": refresh_job,
         "summary": {"total": total, "amount_total": round(amount_total, 2), "status_counts": status_counts},
     }
 

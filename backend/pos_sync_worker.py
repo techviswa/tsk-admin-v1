@@ -23,9 +23,14 @@ class PosSyncWorker:
         self.collection = collection
         self.processor = processor
 
-    async def enqueue_snapshot(self, resource, business_id):
+    async def enqueue_snapshot(self, resource, business_id, fresh_for_seconds=0):
         job_id = f"pos-snapshot:{business_id}:{resource}"
         now = timestamp()
+        if fresh_for_seconds:
+            recent = await self.collection.find_one({"_id": job_id})
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=fresh_for_seconds)).isoformat()
+            if recent and (recent.get("finished_at") or recent.get("updated_at") or recent.get("created_at") or "") >= cutoff:
+                return recent
         try:
             return await self.collection.find_one_and_update(
                 {"_id": job_id, "status": {"$nin": ["pending", "retrying", "running"]}},

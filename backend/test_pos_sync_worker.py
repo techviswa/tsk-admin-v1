@@ -5,10 +5,17 @@ from unittest.mock import AsyncMock
 from pymongo.errors import DuplicateKeyError
 
 from pos_retry import retry_after_seconds
-from pos_sync_worker import PosSyncWorker
+from pos_sync_worker import PosSyncWorker, timestamp
 
 
 class SyncWorkerRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_list_refresh_reuses_completed_snapshot(self):
+        recent = {"id": "pos-snapshot:a:products", "status": "synced", "finished_at": timestamp()}
+        collection = SimpleNamespace(find_one=AsyncMock(return_value=recent), find_one_and_update=AsyncMock())
+        result = await PosSyncWorker(collection, AsyncMock()).enqueue_snapshot("products", "a", fresh_for_seconds=60)
+        self.assertEqual(result, recent)
+        collection.find_one_and_update.assert_not_awaited()
+
     async def test_concurrent_snapshot_request_reuses_active_job(self):
         active = {"id": "pos-snapshot:a:products", "status": "running"}
         collection = SimpleNamespace(find_one_and_update=AsyncMock(side_effect=DuplicateKeyError("active job")),

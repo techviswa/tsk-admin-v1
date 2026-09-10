@@ -83,3 +83,30 @@ This requires matching production keys in the Render configuration of both servi
 Local login credentials were found. Automatic approval review blocked using them
 at the deployed login URL pending explicit user approval. No credentialed production
 check has been performed in this follow-up yet.
+
+## Live sync verification
+
+Authenticated production login succeeded against AdminCore commit 34488f4. Two
+linked businesses were checked across products, bills, payments, customers,
+inventory, reports, and staff. All 14 live POS exports returned HTTP 200 with zero
+business/tenant scope mismatches.
+
+The first stored-data comparison exposed stale AdminCore mirrors: the populated
+business had 0 of 7 payments, 0 of 4 customers, 0 of 39 inventory rows, 0 of 1
+report, and 14 of 16 bills. Scoped production imports repaired this. Final stored
+counts match the POS exports exactly: 45 products, 16 bills, 7 payments,
+4 customers, 39 inventory rows, 1 report, and 27 staff rows. Every sync run reports
+success with zero errors. The second business matches its empty resource sets and
+one report, also with successful sync runs.
+
+An initial read received a 429 with a 239-second cooldown. After the cooldown,
+all checks passed. To reduce future request pressure, unfiltered POS admin page
+loads now queue a durable refresh, reuse a recent completed refresh for 60 seconds,
+poll pending work, and ignore stale responses after business/resource navigation.
+The live verification script reports only statuses, counts, and scope mismatches;
+it does not print credentials, tokens, or records.
+
+The remaining deployment configuration blocker is unchanged: AdminCore health
+reports production_config_ok=false because both services still use the development
+bridge key. No Render API credential or connector is available in this workspace,
+so that environment secret cannot be replaced from this session.
