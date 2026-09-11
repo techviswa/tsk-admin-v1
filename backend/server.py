@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 from pathlib import Path
+from default_outlet import create_default_outlet_once
 from pos_passwords import hash_pos_password
 
 ROOT_DIR = Path(__file__).parent
@@ -4055,8 +4056,8 @@ async def ensure_default_outlet_for_business(
         "created_at": now_ts,
         "updated_at": now_ts,
     }
-    await db.outlets.insert_one(outlet_doc)
-    if user:
+    outlet_doc, created = await create_default_outlet_once(db.outlets, outlet_doc)
+    if user and created:
         await create_audit_log(business_id, user["id"], user["email"], "created", "outlet", outlet_doc["id"], {"name": "Main Outlet", "default": True})
     if sync_to_pos and POS_CORE_API_BASE_URL:
         try:

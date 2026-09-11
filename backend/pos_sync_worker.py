@@ -29,7 +29,7 @@ class PosSyncWorker:
         if fresh_for_seconds:
             recent = await self.collection.find_one({"_id": job_id})
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=fresh_for_seconds)).isoformat()
-            if recent and (recent.get("finished_at") or recent.get("updated_at") or recent.get("created_at") or "") >= cutoff:
+            if recent and recent.get("status") == "synced" and (recent.get("finished_at") or "") >= cutoff:
                 return recent
         try:
             return await self.collection.find_one_and_update(
