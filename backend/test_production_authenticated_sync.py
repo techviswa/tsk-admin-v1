@@ -10,6 +10,38 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class AuthenticatedSyncTests(unittest.IsolatedAsyncioTestCase):
+    def test_rate_limit_stops_followup_http_requests(self):
+        response = SimpleNamespace(status_code=429, headers={"Retry-After": "7"})
+        from unittest.mock import Mock
+        session = SimpleNamespace(request=Mock(return_value=response))
+        with patch.object(server, "POS_CORE_RATE_LIMIT_UNTIL", 0), \
+             patch.object(server, "pos_next_request_at", 0), \
+             patch.object(server.time, "time", return_value=100):
+            for _ in range(2):
+                with self.assertRaises(server.HTTPException) as error:
+                    server.send_pos_request(session, "GET", "https://pos.invalid/api/products")
+                self.assertEqual(error.exception.status_code, 429)
+                self.assertEqual(error.exception.detail["retry_after_seconds"], 7)
+            session.request.assert_called_once()
+
+    async def test_failed_provisioning_records_step_and_retry_history(self):
+        jobs = SimpleNamespace(update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1, matched_count=1)))
+        database = SimpleNamespace(pos_provisioning_jobs=jobs, businesses=SimpleNamespace(update_one=AsyncMock()))
+        async def fail_owner(*args, **kwargs):
+            await kwargs["progress"]("owner")
+            raise server.HTTPException(status_code=502, detail="POS unavailable")
+        with patch.object(server, "db", database), \
+             patch.object(server, "provision_business_end_to_end", side_effect=fail_owner), \
+             patch.object(server, "mark_business_pos_status", new_callable=AsyncMock):
+            await server.run_pos_provisioning_job({"id": "job", "business_id": "a", "attempts": 0, "max_attempts": 5})
+        final_update = jobs.update_one.call_args.args[1]
+        self.assertEqual(final_update["$set"]["status"], "retrying")
+        entry = final_update["$push"]["history"]["$each"][0]
+        self.assertEqual(entry["step"], "owner")
+        self.assertEqual(entry["attempt"], 1)
+        self.assertEqual(final_update["$push"]["history"]["$slice"], -100)
+        database.businesses.update_one.assert_awaited_once()
+
     async def test_user_creation_is_accepted_and_queued_without_pos_call(self):
         account = {"id": "admin", "role": "platform_admin", "email": "admin@example.test"}
         users = SimpleNamespace(find_one=AsyncMock(side_effect=[account, None, {"id": "staff", "email": "staff@example.test"}]),

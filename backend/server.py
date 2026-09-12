@@ -422,6 +422,19 @@ async def run_pos_provisioning_job(job: dict):
         saved = await db.pos_provisioning_jobs.update_one(job_filter, {"$set": {f"steps.{step}": value}})
         if not saved.matched_count:
             raise HTTPException(status_code=409, detail="Provisioning job lease was replaced")
+    current_step = "business"
+    async def progress(step):
+        nonlocal current_step
+        current_step = step
+        timestamp = datetime.now(timezone.utc).isoformat()
+        saved = await db.pos_provisioning_jobs.update_one(job_filter, {
+            "$set": {"current_step": step, "updated_at": timestamp},
+            "$push": {"history": {"$each": [{"step": step, "status": "running", "attempt": attempts, "at": timestamp}], "$slice": -100}},
+        })
+        if not saved.matched_count:
+            raise HTTPException(status_code=409, detail="Provisioning job lease was replaced")
+        await db.businesses.update_one({"id": business_id, "pos_provisioning_job_id": job["id"]},
+                                      {"$set": {"pos_provisioning_step": step}})
     try:
         if attempts > int(job.get("max_attempts") or POS_PROVISIONING_MAX_ATTEMPTS):
             raise HTTPException(status_code=503, detail="Provisioning retry limit reached after worker restart")
@@ -434,12 +447,14 @@ async def run_pos_provisioning_job(job: dict):
             enqueue_on_failure=False,
             steps=job.get("steps", {}),
             checkpoint=checkpoint,
+            progress=progress,
         ), timeout=300)
         if not result.get("configured"):
             raise HTTPException(status_code=503, detail="POS bridge is not configured")
         await db.pos_provisioning_jobs.update_one(
             job_filter,
-            {"$set": {"status": "synced", "result": result, "owner_password": "", "finished_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()}},
+            {"$set": {"status": "synced", "current_step": "complete", "result": result, "owner_password": "", "finished_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat()},
+             "$push": {"history": {"$each": [{"step": "complete", "status": "synced", "attempt": attempts, "at": datetime.now(timezone.utc).isoformat()}], "$slice": -100}}},
         )
     except Exception as exc:
         detail = pos_error_detail(exc)
@@ -458,7 +473,8 @@ async def run_pos_provisioning_job(job: dict):
         else:
             update["owner_password"] = ""
             update["finished_at"] = datetime.now(timezone.utc).isoformat()
-        saved = await db.pos_provisioning_jobs.update_one(job_filter, {"$set": update})
+        saved = await db.pos_provisioning_jobs.update_one(job_filter, {"$set": update,
+            "$push": {"history": {"$each": [{"step": current_step, "status": status, "attempt": attempts, "at": update["updated_at"]}], "$slice": -100}}})
         if saved.matched_count:
             await mark_business_pos_status(business_id, "failed" if status == "failed" else "pending", detail)
 
@@ -536,6 +552,7 @@ async def provision_business_end_to_end(
     enqueue_on_failure: bool = True,
     steps: Optional[dict] = None,
     checkpoint=None,
+    progress=None,
 ) -> dict:
     if not POS_CORE_API_BASE_URL:
         await mark_business_pos_status(business_id, "not_configured")
@@ -546,12 +563,17 @@ async def provision_business_end_to_end(
         if checkpoint:
             await checkpoint(name, value)
         steps[name] = value
+    async def report_step(name):
+        if progress:
+            await progress(name)
     try:
         provisioned = steps.get("business")
         if not provisioned:
+            await report_step("business")
             provisioned = await provision_admin_business_to_pos(business_id)
             await record_step("business", provisioned)
         business = await db.businesses.find_one({"id": business_id}, {"_id": 0})
+        await report_step("owner")
         owner = await ensure_business_owner_user(
             business_id,
             owner_name,
@@ -563,6 +585,7 @@ async def provision_business_end_to_end(
         if steps.get("owner_id") != owner["id"]:
             await push_admin_user_to_pos(owner, owner_password, allow_generated_password=False, target_business_id=business_id)
             await record_step("owner_id", owner["id"])
+        await report_step("outlet")
         outlet = await ensure_default_outlet_for_business(
             business_id,
             user=actor,
@@ -572,6 +595,7 @@ async def provision_business_end_to_end(
         )
         if not outlet or not outlet.get("pos_external_id") or not outlet.get("pos_synced"):
             raise HTTPException(status_code=502, detail="POS default outlet identity was not verified")
+        await report_step("verification")
         verified_owner = await db.users.find_one({"id": owner["id"]}, {"_id": 0})
         owner_link = ((verified_owner or {}).get("pos_links") or {}).get(business_id, {})
         if (not verified_owner or not owner_link.get("user_id")
@@ -583,6 +607,7 @@ async def provision_business_end_to_end(
             "synced",
             extra={
                 "pos_synced_at": datetime.now(timezone.utc).isoformat(),
+                "pos_provisioning_step": "complete",
                 "pos_owner_email": owner.get("email", ""),
                 "pos_owner_id": owner_link["user_id"],
                 "pos_default_outlet_id": outlet["pos_external_id"],

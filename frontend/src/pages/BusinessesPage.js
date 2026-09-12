@@ -180,6 +180,11 @@ export default function BusinessesPage() {
                     <Badge className={`text-[11px] ${posStatusColor(biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not_configured'))}`}>
                       {biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not configured')}
                     </Badge>
+                    {biz.pos_provisioning_step && (
+                      <p className="text-[11px] text-zinc-600">
+                        {{ business: 'Creating POS business', owner: 'Setting up owner access', outlet: 'Setting up outlet', verification: 'Verifying linked records', complete: 'Setup complete' }[biz.pos_provisioning_step] || 'Processing setup'}
+                      </p>
+                    )}
                     {biz.pos_provisioning_error && (
                       <p className="max-w-[220px] truncate text-[11px] text-red-600" title={formatApiDetail(biz.pos_provisioning_error_detail || biz.pos_provisioning_error)}>
                         {formatApiDetail(biz.pos_provisioning_error)}
