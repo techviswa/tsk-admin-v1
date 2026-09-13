@@ -10,6 +10,39 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class AuthenticatedSyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_order_change_refreshes_kitchen_for_same_business_and_retries_failure(self):
+        with patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={"id": "system"}), \
+             patch.object(server, "sync_pos_bridge_resource_for_system", new_callable=AsyncMock) as sync:
+            sync.return_value = {"status": "success", "error_count": 0}
+            await server.process_pos_change("orders", "business-a", {"action": "updated"})
+            self.assertEqual([(call.args[0], call.args[1]) for call in sync.await_args_list],
+                             [(resource, "business-a") for resource in ["orders", "kitchen-tickets", "customers", "reports"]])
+            sync.reset_mock()
+            failure = {"status": "failed", "error_count": 1, "errors": ["POS unavailable"]}
+            sync.side_effect = [{"status": "success", "error_count": 0}, failure]
+            self.assertEqual(await server.process_pos_change("orders", "business-a", {"action": "updated"}), failure)
+            self.assertEqual(sync.await_count, 2)
+
+    async def test_manual_user_sync_queues_all_businesses_without_pos_call(self):
+        account = {"id": "admin", "role": "platform_admin", "email": "admin@example.test"}
+        target = {"id": "staff", "email": "staff@example.test", "business_ids": ["a", "b"]}
+        database = SimpleNamespace(users=SimpleNamespace(find_one=AsyncMock(side_effect=lambda query, *args: account if query.get("id") == "admin" else target)),
+                                   pos_profile_jobs=SimpleNamespace(find_one=AsyncMock(return_value=None)))
+        with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
+             patch.object(server, "validate_business_access", new_callable=AsyncMock) as scope, \
+             patch.object(server, "require_business_module_enabled", new_callable=AsyncMock), \
+             patch.object(server.pos_profile_updates, "enqueue", new_callable=AsyncMock, return_value={"status": "pending"}) as enqueue, \
+             patch.object(server, "push_admin_user_to_pos", new_callable=AsyncMock) as push:
+            token = server.create_access_token(account["id"], account["email"])
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://test") as client:
+                result = await client.post("/api/users/staff/sync-pos", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(result.status_code, 202, result.text)
+            self.assertEqual(result.json()["status"], "pending")
+            self.assertEqual(enqueue.call_args.args[0]["business_ids"], ["a", "b"])
+            self.assertEqual(enqueue.call_args.kwargs["operation"], "sync")
+            self.assertEqual([call.args[1] for call in scope.await_args_list], ["a", "b"])
+            push.assert_not_awaited()
+
     def test_rate_limit_stops_followup_http_requests(self):
         response = SimpleNamespace(status_code=429, headers={"Retry-After": "7"})
         from unittest.mock import Mock

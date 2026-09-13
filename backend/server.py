@@ -2445,7 +2445,7 @@ async def update_user(user_id: str, data: UserUpdate, request: Request, response
     await create_audit_log((update_data.get("business_ids") or existing.get("business_ids") or [None])[0], user["id"], user["email"], "updated", "user", user_id, {**{k: v for k, v in update_data.items() if k != "password_hash"}, "pos_pushed": bool(pos_push)})
     return await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
 
-@user_router.post("/{user_id}/sync-pos")
+@user_router.post("/{user_id}/sync-pos", status_code=202)
 async def sync_user_to_pos(user_id: str, request: Request):
     user = await get_current_user(request)
     if user["role"] not in ["platform_admin", "business_owner", "manager"]:
@@ -2464,12 +2464,13 @@ async def sync_user_to_pos(user_id: str, request: Request):
     if job and job.get("status") in {"pending", "running", "retrying", "failed"}:
         await db.pos_profile_jobs.update_one({"_id": user_id, "status": "failed"},
                                               {"$set": {"status": "retrying", "attempts": 0, "run_after": datetime.now(timezone.utc).isoformat()}})
-        return {"message": "POS profile update queued", "status": "pending"}
-    result = await push_admin_user_to_pos(target_user)
-    if not result:
+        return {"message": "POS profile update queued", "status": "retrying" if job.get("status") == "failed" else job["status"]}
+    if not target_user.get("business_ids"):
         raise HTTPException(status_code=400, detail="User is not assigned to a POS-syncable business")
-    await create_audit_log((target_user.get("business_ids") or [None])[0], user["id"], user["email"], "synced", "user", user_id, {"target": "pos"})
-    return {"message": "User synced to POS", "result": result}
+    if not POS_CORE_API_BASE_URL:
+        raise HTTPException(status_code=503, detail="POS bridge is not configured")
+    result = await pos_profile_updates.enqueue(target_user, {}, None, user, operation="sync")
+    return {"message": "POS profile update queued", **result}
 
 @user_router.delete("/{user_id}")
 async def delete_user(user_id: str, request: Request):
@@ -4959,7 +4960,7 @@ async def process_pos_change(resource, business_id, event=None):
             })
     dependencies = {
         "bills": ["payments", "customers", "reports", "products", "inventory"],
-        "orders": ["customers", "reports"],
+        "orders": ["kitchen-tickets", "customers", "reports"],
         "payments": ["reports"],
         "inventory": ["reports"],
     }

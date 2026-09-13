@@ -110,7 +110,7 @@ export default function UsersPage() {
   const handleSyncToPOS = async (u) => {
     try {
       const { data } = await api.post(`/users/${u.id}/sync-pos`);
-      toast.success(data.status === 'pending' ? 'Profile update queued' : 'User synced to POS');
+      toast.success(data.status === 'running' ? 'POS sync is in progress' : 'POS sync queued. Check the user status for progress.');
       fetchUsers();
     } catch (err) { toast.error(`POS sync failed: ${formatApiError(err)}`); }
   };
