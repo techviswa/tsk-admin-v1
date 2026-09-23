@@ -78,3 +78,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: npm run build
+
+      - name: Verify safe backend recovery
+        working-directory: frontend
+        run: npm test -- --watchAll=false --runInBand api.recovery.test.js

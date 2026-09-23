@@ -6,13 +6,17 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
 
   const checkAuth = useCallback(async () => {
+    setLoading(true);
+    setUnavailable(false);
     try {
       const { data } = await api.get('/auth/me');
       setUser(data);
-    } catch {
-      setUser(false);
+    } catch (error) {
+      if ([401, 403].includes(error.response?.status)) setUser(false);
+      else setUnavailable(true);
     } finally {
       setLoading(false);
     }
@@ -44,7 +48,7 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider value={{ user, loading, login, register, logout, setUser }}>
-      {children}
+      {unavailable ? <div role="alert" style={{ padding: 24 }}><p>AdminCore is temporarily unavailable or waking up. Your saved session has been kept.</p><button onClick={checkAuth}>Try connecting again</button></div> : children}
     </AuthContext.Provider>
   );
 }

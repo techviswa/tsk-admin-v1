@@ -16,6 +16,11 @@ const api = axios.create({
 
 const ACCESS_TOKEN_KEY = 'admincore_access_token';
 const REFRESH_TOKEN_KEY = 'admincore_refresh_token';
+let wakeRequest;
+const wakeBackend = () => {
+  if (!wakeRequest) wakeRequest = axios.get(`${API_URL}/api/health`, { timeout: 65000 }).finally(() => { wakeRequest = null; });
+  return wakeRequest;
+};
 
 export function setAuthTokens(accessToken, refreshToken) {
   if (accessToken) localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
@@ -44,16 +49,15 @@ api.interceptors.response.use(
     const isAuthRequest = original?.url?.startsWith('/auth/login') || original?.url?.startsWith('/auth/register') || original?.url?.startsWith('/auth/refresh');
     const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
     const method = String(original?.method || 'get').toLowerCase();
-    const retryableAfterWake = ['get', 'head', 'options'].includes(method)
-      || original?.url?.startsWith('/auth/login')
-      || original?.url?.startsWith('/auth/refresh');
+    const retryableAfterWake = ['get', 'head', 'options'].includes(method);
     const connectionFailed = error?.code === 'ECONNABORTED'
-      || (error?.message === 'Network Error' && !error?.response);
+      || (error?.message === 'Network Error' && !error?.response)
+      || [502, 503, 504].includes(status);
 
     if (connectionFailed && original && !original._networkRetry && retryableAfterWake) {
       original._networkRetry = true;
       try {
-        await axios.get(`${API_URL}/api/health`, { timeout: 65000 });
+        await wakeBackend();
         original.timeout = original.url?.startsWith('/auth/') ? 90000 : 45000;
         return api(original);
       } catch {
@@ -74,7 +78,7 @@ api.interceptors.response.use(
         original.headers.Authorization = `Bearer ${data.access_token}`;
         return api(original);
       } catch (refreshError) {
-        clearAuthTokens();
+        if (refreshError.response?.status === 401) clearAuthTokens();
         return Promise.reject(refreshError);
       }
     }
@@ -144,10 +148,10 @@ export function formatApiDetail(value) {
 // Format API error detail for display
 export function formatApiError(err) {
   if (err?.code === 'ECONNABORTED') {
-    return 'Request timed out. The server did not finish in time; retry after the backend finishes waking up or check the sync health details.';
+    return 'The server may be waking up. Please try again shortly. Before repeating a save or payment, check whether it already completed.';
   }
   if (err?.message === 'Network Error' && !err?.response) {
-    return 'AdminCore did not respond. Its health check and CORS configuration are valid; retry once after the service finishes waking up.';
+    return 'Unable to reach AdminCore. Check your connection and try again shortly.';
   }
   const detail = err?.response?.data?.detail;
   if (!detail) return err?.message || 'Something went wrong';
