@@ -4,7 +4,14 @@ jest.mock('axios', () => {
   return { create: jest.fn(() => client), get: jest.fn(), post: jest.fn() };
 });
 import axios from 'axios';
-import api from './api';
+import api, { clearAuthTokens, formatApiError } from './api';
+
+test('structured errors show the actionable message without upstream diagnostics', () => {
+  expect(formatApiError({ response: { data: { detail: {
+    code: 'POS_BRIDGE_UNAUTHORIZED', message: 'Check the POS connection settings, then retry.',
+    url: 'private-upstream-url',
+  } } } })).toBe('Check the POS connection settings, then retry.');
+});
 
 const onError = api.interceptors.response.use.mock.calls[0][1];
 beforeEach(() => { axios.get.mockReset(); axios.post.mockReset(); api.mockReset(); localStorage.clear(); });
@@ -31,12 +38,19 @@ test('a timed-out payment or login is never automatically replayed', async () =>
   expect(api).not.toHaveBeenCalled();
 });
 
-test('refresh outage retains tokens; confirmed invalid refresh removes them', async () => {
-  localStorage.setItem('admincore_refresh_token', 'fixture-token');
-  axios.post.mockRejectedValueOnce({ code: 'ECONNABORTED' });
-  await expect(onError({ config: { method: 'get', url: '/products' }, response: { status: 401 } })).rejects.toMatchObject({ code: 'ECONNABORTED' });
-  expect(localStorage.getItem('admincore_refresh_token')).toBe('fixture-token');
+test('an expired session is refreshed once through the cookie, then the request is retried', async () => {
+  axios.post.mockResolvedValueOnce({ data: { message: 'Token refreshed' } });
+  api.mockResolvedValueOnce({ data: 'ok' });
+  await expect(onError({ config: { method: 'get', url: '/products' }, response: { status: 401 } })).resolves.toEqual({ data: 'ok' });
+  expect(axios.post.mock.calls[0][2]).toMatchObject({ withCredentials: true, headers: { 'X-Requested-With': 'XMLHttpRequest' } });
   axios.post.mockRejectedValueOnce({ response: { status: 401 } });
   await expect(onError({ config: { method: 'get', url: '/products' }, response: { status: 401 } })).rejects.toMatchObject({ response: { status: 401 } });
+});
+
+test('no session token is ever kept in browser storage', () => {
+  localStorage.setItem('admincore_access_token', 'legacy');
+  localStorage.setItem('admincore_refresh_token', 'legacy');
+  clearAuthTokens();
+  expect(localStorage.getItem('admincore_access_token')).toBeNull();
   expect(localStorage.getItem('admincore_refresh_token')).toBeNull();
 });

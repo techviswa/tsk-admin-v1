@@ -1,0 +1,46 @@
+{
+  "date": "2026-11-01",
+  "scope": "Local billing workspaces and Admin service recovery; not hosted release approval",
+  "frontend_tests": {
+    "admin": 45,
+    "pos": 131
+  },
+  "ci_production_builds": {
+    "admin": "passed",
+    "pos": "passed"
+  },
+  "disposable_api_run": "970cb029b897485ba3f20d6053df472c",
+  "browser_checks": "Actual local apps; 1440/1024/390; no merchant saves",
+  "original_record_ids": "preserved in AdminCore and POS",
+  "deployed": false,
+  "sha256": {
+    "admin/scripts/dev.mjs": "600c6c2cb35e7b4dccc9ec610eadc7f8d8fd7d36318541359831bd68207094c0",
+    "admin/scripts/python-runtime.mjs": "352a248da3d7b14acb423af012e944d87587b3fd42c69651c6a923b80e2573f9",
+    "admin/frontend/src/pages/DashboardPage.js": "559f329ad69bb090bd0f4deca935d084f7c916d52ec73e8587da00cdc3128611",
+    "admin/frontend/src/pages/DashboardPage.test.js": "d46dd4f46a3aa3eb65fa3528ed81ff05860685849232475023a7412dfb78586f",
+    "admin/frontend/src/pages/ClientsPage.js": "ccad1e08ff73743920951dab42d4cafaf7ae9eb20067b954486243d26b945530",
+    "admin/frontend/src/components/layout/DashboardLayout.js": "ba8263a17000bd1e10b7426dc02ba34c3eea5f0eff58774232bc6afae4c5a3a3",
+    "admin/tests/coupled_fixture.mjs": "c285699f4bf311c80f2da42bfd1ed1e906483cd7e3f46b91ebdf6a71845f1ec7",
+    "admin/tests/coupled_api_check.py": "f7ba352517f6619ad9520cfc7b1b59e667a143a4a556b68ae5b05e315e2124d7",
+    "pos/frontend/src/App.js": "41a1a59532c756fbd4e277e5b8f99c22770e9e4603a94ff5e71c8f8169ecc849",
+    "pos/frontend/src/App.css": "184e06377d0e3f4e02a726764aef0c35555ddd145e74314ec5b183c7b509027f",
+    "pos/frontend/src/pages/Billing.js": "368c4a67d21a9794bf8efc75d787848d8fca8be5f04a9cd5b1f64527b9726876",
+    "pos/frontend/src/pages/Billing.scope.test.js": "df57e7ca3fbbe8aaa0b0a6c8efd2cbe205584eaf86921042bd75a438d06f271e",
+    "pos/frontend/src/pages/Bills.js": "011d52b536870cc70bc05e4cec7229b1ad4aa68f121d7d8cc81a80f42abc7608",
+    "pos/frontend/src/pages/Bills.scope.test.js": "e3e24d5cc0fa7f28f6c9b12c035a853e9f8037fd05097ffa52b7975ba9c24d6b",
+    "pos/frontend/src/pages/CashDrawer.js": "f6071253ec1d321cf22f3d876583775b8e634960e378315c2d8b0b247e3ee28b",
+    "pos/frontend/src/pages/PlanBilling.js": "f4041b4dd520a3de262b5cc4191eea31409f7f9dcf157e6e43ed5a7d4f1ac222",
+    "pos/frontend/src/components/QrCheckoutInbox.jsx": "04c119dba52b0cde627e0d6be9e63d5c49951112254797895005260a63d8ef86",
+    "pos/frontend/src/components/QrCheckoutInbox.test.js": "31625d4750a86c31c6b350504c441647abce4dcd313aa6298c258967e704eeab",
+    "pos/frontend/src/components/ui/dialog.jsx": "0418000f01f7940e1929f2447c3484112703b50cc80cc4c7b317ba6031f4912c",
+    "pos/frontend/src/core/billing/components/CashierSettlement.jsx": "661ceceb94f4915f8b3e83a9bd6bcb57065350293b5f395c5e26dfb0b550e6d8",
+    "pos/frontend/src/core/billing/components/CashierSettlement.test.js": "b7169e0cc972636b7bd7e0e6f83199f00ff535e3a56ed3223e62a580489a30a6",
+    "pos/frontend/src/core/billing/utils/reuseBill.js": "cc1b6e3d38aa84f369c68a0ec0cad29e34acd95025005fea93bf601b4a9f9f58",
+    "pos/frontend/src/core/billing/utils/reuseBill.test.js": "b0a83783ad723c5bc6d0b83b9da95f210c09f3f095b2e7a592ab3b42a804c357",
+    "pos/frontend/src/core/navigation/config/appNavigation.js": "88e550909254ce88aeb09c9a35858d36fe9d00b91db8e361344356f4e304e37d",
+    "pos/frontend/src/core/navigation/utils/appAccess.js": "a9549b5c5382d6da5cc0b7dcc3eca017556e8d8f28bfb3a45658f0fa36a49ba7",
+    "pos/frontend/src/core/navigation/utils/appAccess.test.js": "8d7e6a317bb084d940614b7d8600e5c89a88aab629885504ff5a8ccd0fe9f1e9",
+    "pos/backend/src/core/billing/billing.controller.js": "d6dc8314a42027bc53b03f1454ec236015cfaa779cb287f2f124effb3b9bca4b",
+    "pos/backend/src/core/billing/billing.service.js": "01b3c27049e8e51aedaeb2d82f9aa445f4395c74e82fb113b2998268f2f8e547"
+  }
+}

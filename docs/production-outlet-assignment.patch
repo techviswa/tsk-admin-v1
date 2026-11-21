@@ -1,0 +1,11 @@
+--- a/backend/src/core/outlets/outlets.service.js
++++ b/backend/src/core/outlets/outlets.service.js
+@@ -486,7 +486,7 @@
+   }
+ 
+   async updateOutlet({ tenantId, outletId, payload }) {
+-    const { outlet } = await this.getOutletRecord({ tenantId, outletId });
++    const { business, outlet } = await this.getOutletRecord({ tenantId, outletId });
+ 
+     await prisma.outlet.update({
+       where: { id: outletId },

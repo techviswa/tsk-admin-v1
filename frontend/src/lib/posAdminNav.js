@@ -3,6 +3,7 @@ import {
   HandCoins, History, Plug, Printer, Receipt, ShieldCheck, ShoppingBag, Table2,
   Tags, Truck, UserRound, Users, CalendarDays
 } from 'lucide-react';
+import { POS_OPERATIONS } from './posOperations';
 
 export const POS_ADMIN_NAV = [
   { priority: 1, path: '/pos-admin/sales-orders', label: 'POS Orders', icon: ShoppingBag, moduleSlug: 'pos' },
@@ -25,4 +26,5 @@ export const POS_ADMIN_NAV = [
   { priority: 18, path: '/pos-admin/import-export', label: 'Import Export', icon: Download, moduleSlug: 'import_export' },
   { priority: 19, path: '/pos-admin/integrations-webhooks', label: 'Webhooks', icon: Plug, moduleSlug: 'integrations' },
   { priority: 20, path: '/pos-admin/audit-security', label: 'Audit Security', icon: History, moduleSlug: 'audit_security' },
+  ...Object.entries(POS_OPERATIONS).map(([key, config], index) => ({ priority: 21 + index, path: `/pos-admin/${key}`, label: config.title, icon: key === 'central-kitchen' ? Truck : key === 'attendance' ? CalendarClock : Receipt, moduleSlug: config.module })),
 ];

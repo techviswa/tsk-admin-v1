@@ -16,6 +16,11 @@ if (config.enableHealthCheck) {
 }
 
 let webpackConfig = {
+  jest: {
+    configure: {
+      moduleNameMapper: { '^@/(.*)$': '<rootDir>/src/$1' },
+    },
+  },
   eslint: {
     configure: {
       extends: ["plugin:react-hooks/recommended"],
@@ -52,6 +57,18 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  // Mirror the production /api rewrite; API_PROXY_TARGET can select a local API.
+  devServerConfig.proxy = {
+    ...devServerConfig.proxy,
+    '/api': {
+      target: process.env.API_PROXY_TARGET || 'http://127.0.0.1:8000',
+      changeOrigin: true,
+      cookieDomainRewrite: '',
+      proxyTimeout: 120000,
+      timeout: 120000,
+    },
+  };
+
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;
 

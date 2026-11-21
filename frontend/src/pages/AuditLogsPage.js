@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
-import api from '@/lib/api';
-import { toast } from 'sonner';
+import { hasPlatformPermission } from '@/lib/permissions';
+import { entityLabel } from '@/lib/posOperations';
+import api, { formatApiError } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -21,36 +22,37 @@ const ACTION_COLORS = {
 export default function AuditLogsPage() {
   const { selectedBusiness } = useBusiness();
   const { user } = useAuth();
+  const canReadAll = hasPlatformPermission(user, 'audit.read');
   const [logs, setLogs] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(0);
   const [entityFilter, setEntityFilter] = useState('all');
+  const [error, setError] = useState('');
   const limit = 20;
 
   const fetchLogs = useCallback(async (signal) => {
+    setError('');
     try {
       let url, params;
       if (selectedBusiness) {
         url = `/audit-logs/business/${selectedBusiness.id}`;
         params = { limit, skip: page * limit };
-      } else if (user?.role === 'platform_admin') {
+      } else if (canReadAll) {
         url = '/audit-logs';
         params = { limit, skip: page * limit };
       } else {
         setLoading(false);
         return;
       }
+      params.entity_type = entityFilter === 'all' ? undefined : entityFilter;
       const { data } = await api.get(url, { params, signal });
-      let filteredLogs = data.logs || [];
-      if (entityFilter !== 'all') {
-        filteredLogs = filteredLogs.filter(l => l.entity_type === entityFilter);
-      }
-      setLogs(filteredLogs);
+      if (signal?.aborted) return;
+      setLogs(data.logs || []);
       setTotal(data.total || 0);
-    } catch { if (!signal?.aborted) toast.error('Failed to load audit logs'); }
+    } catch (err) { if (!signal?.aborted) setError(formatApiError(err)); }
     finally { if (!signal?.aborted) setLoading(false); }
-  }, [selectedBusiness, user?.role, page, entityFilter]);
+  }, [selectedBusiness, canReadAll, page, entityFilter]);
 
   useEffect(() => { setPage(0); }, [selectedBusiness, entityFilter]);
   useEffect(() => {
@@ -81,6 +83,7 @@ export default function AuditLogsPage() {
       </div>
 
       <div className="bg-white border border-zinc-200 rounded-lg overflow-hidden shadow-sm">
+        {error && <div role="alert" className="p-3 text-sm text-red-700">Audit logs could not load: {error} <Button variant="outline" size="sm" onClick={() => fetchLogs()}>Retry</Button></div>}
         <Table>
           <TableHeader>
             <TableRow className="bg-zinc-50 hover:bg-zinc-50">
@@ -94,16 +97,16 @@ export default function AuditLogsPage() {
           <TableBody>
             {loading ? (
               <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-400">Loading...</TableCell></TableRow>
-            ) : logs.length === 0 ? (
+            ) : error ? null : logs.length === 0 ? (
               <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-400">No audit logs found</TableCell></TableRow>
             ) : logs.map(log => (
               <TableRow key={log.id} className="hover:bg-zinc-50/50">
                 <TableCell className="text-xs text-zinc-500 py-3 whitespace-nowrap font-mono">{new Date(log.created_at).toLocaleString()}</TableCell>
                 <TableCell className="text-sm text-zinc-700 py-3">{log.user_email || 'System'}</TableCell>
                 <TableCell className="py-3"><Badge className={`text-[11px] ${ACTION_COLORS[log.action] || 'bg-zinc-100 text-zinc-600'}`}>{log.action}</Badge></TableCell>
-                <TableCell className="py-3"><Badge variant="outline" className="text-[11px]">{log.entity_type}</Badge></TableCell>
-                <TableCell className="text-xs text-zinc-500 py-3 max-w-[200px] truncate font-mono">
-                  {log.details && Object.keys(log.details).length > 0 ? JSON.stringify(log.details) : '-'}
+                <TableCell className="py-3"><Badge variant="outline" className="text-[11px]">{entityLabel(log.entity_type)}</Badge></TableCell>
+                <TableCell className="text-xs text-zinc-500 py-3 max-w-[320px]">
+                  {log.details && Object.keys(log.details).length > 0 ? <details><summary className="cursor-pointer">View changes</summary><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words">{JSON.stringify(log.details, null, 2)}</pre></details> : 'No additional details'}
                 </TableCell>
               </TableRow>
             ))}

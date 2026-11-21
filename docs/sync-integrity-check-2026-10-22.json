@@ -1,0 +1,88 @@
+{
+  "checked_at": "2026-10-22T12:55:06.019665+00:00",
+  "mode": "read_only",
+  "resources": [
+    {
+      "resource": "products",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "bills",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "payments",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "customers",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "inventory",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "reports",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "staff-shifts",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-1"
+    },
+    {
+      "resource": "products",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-2"
+    },
+    {
+      "resource": "bills",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-2"
+    },
+    {
+      "resource": "payments",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-2"
+    },
+    {
+      "resource": "customers",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-2"
+    },
+    {
+      "resource": "inventory",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-2"
+    },
+    {
+      "resource": "reports",
+      "http_status": 429,
+      "error_code": "POS_RATE_LIMITED",
+      "business": "linked-business-2"
+    }
+  ],
+  "deployed_revision": "5379db8a55c9fc1232ebd1694a37dc67e0aff84b",
+  "verification_complete": false,
+  "limitation": "POS returned HTTP 429 POS_RATE_LIMITED. Live row consistency could not be verified. The diagnostic stopped; no sync writes were submitted.",
+  "affected_user_count": 3
+}

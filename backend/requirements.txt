@@ -25,3 +25,5 @@ python-multipart>=0.0.9
 jq>=1.6.0
 typer>=0.9.0
 qrcode[pil]>=8.2
+sentry-sdk[fastapi]>=2.0
+reportlab>=4.4,<5

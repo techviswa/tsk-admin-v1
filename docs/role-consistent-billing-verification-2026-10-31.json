@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-31",
+  "result": "passed",
+  "frontend_tests": 102,
+  "production_build": "passed",
+  "isolated_api_run": "88cc99154e75403abc1c806bbdff7e1b",
+  "api_checks": [
+    "owner/waiter stock parity",
+    "outlet balance and central fallback",
+    "actual zero preserved",
+    "cost/vendor exclusion",
+    "inventory-management and other-outlet access denied",
+    "empty bill rejected without record",
+    "waiter invoice creation",
+    "waiter confirmed cash collection"
+  ],
+  "browser_widths": [
+    1915,
+    1440,
+    1024,
+    768,
+    390,
+    320
+  ],
+  "browser_scope": "Actual rendered component with compiled CSS, long synthetic DOM list; screenshots inspected",
+  "pos_source_sha256": {
+    "frontend/src/App.css": "bf0435339bf5e51a2ac40b3d68326b74792782dbfb7e579ecfd738d7f738a242",
+    "frontend/src/pages/Billing.js": "394ed8843e5b5097b33a0a4d4ab97be9bc3bb05da49b3499d6351b2ff67e8c24",
+    "frontend/src/pages/Billing.scope.test.js": "1be0a272f6db90855f6a49972e0b0d3066dfff7c2bcef4264a6051100c80340b",
+    "backend/src/core/billing/billing.routes.js": "25f5901eb161c18db257642158bd37e5419169a3d8b1ab5b6eb2c3e6cbac6e8e"
+  },
+  "notes": [
+    "Waiter checkout rights retained as explicitly requested",
+    "No existing business data or financial rules changed",
+    "No hosted deployment or physical payment/device acceptance"
+  ]
+}

@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
-import { formatApiError } from '@/lib/api';
+import api, { formatApiError } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -10,7 +10,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Store, AlertCircle, Eye, EyeOff } from 'lucide-react';
 
 export default function LoginPage() {
-  const { login, register } = useAuth();
+  const { login, register, verifyMfa } = useAuth();
   const navigate = useNavigate();
   const [tab, setTab] = useState('login');
   const [email, setEmail] = useState('');
@@ -19,15 +19,44 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [mfaToken, setMfaToken] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+  const [registrationOpen, setRegistrationOpen] = useState(true);
+
+  useEffect(() => {
+    // Hide self-registration when the server has switched it off (production default).
+    api.get('/auth/config').then(({ data }) => setRegistrationOpen(Boolean(data.self_registration))).catch(() => {});
+  }, []);
 
   const handleLogin = async (e) => {
     e.preventDefault();
     setError('');
     setLoading(true);
     try {
-      await login(email, password);
+      const result = await login(email, password);
+      if (result?.mfaRequired) {
+        setMfaToken(result.mfaToken);
+        setPassword('');
+        return;
+      }
       navigate('/');
     } catch (err) {
+      setError(formatApiError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleMfa = async (e) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      await verifyMfa(mfaToken, mfaCode);
+      navigate('/');
+    } catch (err) {
+      const expired = err?.response?.status === 401 && /expired/i.test(formatApiError(err));
+      if (expired) { setMfaToken(''); setMfaCode(''); }
       setError(formatApiError(err));
     } finally {
       setLoading(false);
@@ -61,10 +90,32 @@ export default function LoginPage() {
 
         <Card className="shadow-sm border-zinc-200">
           <CardContent className="pt-6">
-            <Tabs value={tab} onValueChange={setTab}>
-              <TabsList className="grid w-full grid-cols-2 mb-6 bg-zinc-100/80" data-testid="auth-tabs">
+            {mfaToken ? (
+              <form onSubmit={handleMfa} className="space-y-4" data-testid="mfa-form">
+                <div>
+                  <h2 className="text-lg font-semibold text-zinc-900">Two-factor authentication</h2>
+                  <p className="text-sm text-zinc-500">Enter the 6-digit code from your authenticator app, or a recovery code.</p>
+                </div>
+                {error && (
+                  <div className="flex items-center gap-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2" data-testid="auth-error">
+                    <AlertCircle className="h-4 w-4 shrink-0" />
+                    <span>{error}</span>
+                  </div>
+                )}
+                <div className="space-y-2">
+                  <Label htmlFor="mfa-login-code">Verification code</Label>
+                  <Input id="mfa-login-code" autoFocus autoComplete="one-time-code" value={mfaCode} onChange={e => setMfaCode(e.target.value)} required data-testid="mfa-login-code" />
+                </div>
+                <Button type="submit" className="w-full bg-blue-600 hover:bg-blue-700" disabled={loading} data-testid="mfa-login-submit">
+                  {loading ? 'Verifying...' : 'Verify'}
+                </Button>
+                <Button type="button" variant="ghost" className="w-full" onClick={() => { setMfaToken(''); setMfaCode(''); setError(''); }}>Back to sign in</Button>
+              </form>
+            ) : (
+            <Tabs value={registrationOpen ? tab : 'login'} onValueChange={setTab}>
+              <TabsList className={`grid w-full ${registrationOpen ? 'grid-cols-2' : 'grid-cols-1'} mb-6 bg-zinc-100/80`} data-testid="auth-tabs">
                 <TabsTrigger value="login" data-testid="login-tab">Sign In</TabsTrigger>
-                <TabsTrigger value="register" data-testid="register-tab">Register</TabsTrigger>
+                {registrationOpen && <TabsTrigger value="register" data-testid="register-tab">Register</TabsTrigger>}
               </TabsList>
 
               {error && (
@@ -120,12 +171,15 @@ export default function LoginPage() {
                 </form>
               </TabsContent>
             </Tabs>
+            )}
           </CardContent>
         </Card>
 
-        <p className="text-center text-xs text-zinc-400 mt-6">
-          Demo: admin@admin.com / admin123
-        </p>
+        {process.env.NODE_ENV !== 'production' && (
+          <p className="text-center text-xs text-zinc-400 mt-6">
+            Local development — sign in with your local administrator account.
+          </p>
+        )}
       </div>
     </div>
   );

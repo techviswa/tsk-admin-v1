@@ -1,0 +1,311 @@
+--- /dev/null
++++ b/backend/scripts/operational-notification-tests.mjs
+@@ -0,0 +1,25 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { queueOperationalSnapshot, OPERATIONAL_SIGNALS } from '../src/core/sync/operational-notifications.js';
++
++test('new operational signals create durable current-state jobs with verified tenant scope', async () => {
++  for (const [resource, target] of Object.entries(OPERATIONAL_SIGNALS)) {
++    let written;
++    const client = { business: { findUnique: async () => ({ id: 'b', tenantId: 't' }) },
++      backgroundJob: { create: async args => { written = args.data; return written; } } };
++    await queueOperationalSnapshot(client, { businessId: 'b', resource, recordId: 'r', action: 'deleted', secret: 'private' }, true);
++    assert.equal(written.type, 'admincore.notify-change'); assert.equal(written.payload.resource, target);
++    assert.equal(written.payload.business_id, 'b'); assert.equal(written.payload.tenant_id, 't');
++    assert.equal(written.payload.action, 'snapshot'); assert.equal(written.payload.secret, undefined);
++  }
++});
++
++test('disabled bridges and unrelated live signals do not create duplicate outbox jobs', async () => {
++  assert.equal(await queueOperationalSnapshot({}, { businessId: 'b', resource: 'tips' }, false), null);
++  assert.equal(await queueOperationalSnapshot({}, { businessId: 'b', resource: 'orders' }, true), null);
++});
++
++test('outbox failure propagates to the caller transaction', async () => {
++  const client = { business: { findUnique: async () => ({ id: 'b', tenantId: 't' }) }, backgroundJob: { create: async () => { throw new Error('queue unavailable'); } } };
++  await assert.rejects(queueOperationalSnapshot(client, { businessId: 'b', resource: 'tips' }, true), /queue unavailable/);
++});
+--- a/backend/src/services/realtime/realtime.service.js
++++ b/backend/src/services/realtime/realtime.service.js
+@@ -5,6 +5,7 @@
+ import env from "../../config/env.js";
+ import prisma from "../../database/prisma/client.js";
+ import { logger } from "../../shared/utils/logger.js";
++import { queueOperationalSnapshot } from "../../core/sync/operational-notifications.js";
+ 
+ /**
+  * Live "something changed" signals for staff screens (kitchen, waiter, billing, QR inbox, tables).
+@@ -106,11 +107,15 @@
+     at: new Date().toISOString(),
+   });
+   if (tx) {
++    await queueOperationalSnapshot(tx, { businessId, resource, action, recordId, outletId }, env.admincore.enabled && Boolean(env.admincore.apiBaseUrl));
+     await tx.$executeRaw`SELECT pg_notify(${CHANNEL}, ${payload})`;
+     return;
+   }
+   try {
+-    await prisma.$executeRaw`SELECT pg_notify(${CHANNEL}, ${payload})`;
++    await prisma.$transaction(async client => {
++      await queueOperationalSnapshot(client, { businessId, resource, action, recordId, outletId }, env.admincore.enabled && Boolean(env.admincore.apiBaseUrl));
++      await client.$executeRaw`SELECT pg_notify(${CHANNEL}, ${payload})`;
++    });
+   } catch (error) {
+     logger.warn(`Realtime publish failed: ${error.message}`);
+   }
+--- a/backend/src/features/kitchen/kot/kot.service.js
++++ b/backend/src/features/kitchen/kot/kot.service.js
+@@ -182,7 +182,7 @@
+     return ticket;
+   }
+ 
+-  async listTickets({ tenantId, limit, status, stationId, active = false, outletIds }) {
++  async listTickets({ tenantId, limit, offset = 0, ascending = false, status, stationId, active = false, outletIds }) {
+     const business = await ensureBusiness({ tenantId });
+     const parsedLimit = Number(limit);
+     const tickets = await prisma.kitchenTicket.findMany({
+@@ -196,7 +196,8 @@
+         ] } } : {}),
+       },
+       include: getTicketInclude(),
+-      orderBy: { createdAt: "desc" },
++        orderBy: [{ createdAt: ascending ? "asc" : "desc" }, { id: "asc" }],
++        skip: offset,
+       ...(Number.isInteger(parsedLimit) && parsedLimit > 0 ? { take: parsedLimit } : {}),
+     });
+ 
+--- /dev/null
++++ b/backend/src/core/sync/operational-notifications.js
+@@ -0,0 +1,20 @@
++import { randomUUID } from 'node:crypto';
++
++export const OPERATIONAL_SIGNALS = Object.freeze({
++  attendance: 'attendance', tips: 'tips', payroll: 'payroll', customers: 'customer-profiles',
++  gift_cards: 'gift-cards', marketing: 'marketing', price_rules: 'menu-pricing',
++  qr_feedback: 'guest-feedback', table_assistance: 'table-assistance',
++});
++
++// Called with the same transaction as the existing live signal. Payloads contain
++// identifiers only; the receiving worker fetches current, scoped source records.
++export async function queueOperationalSnapshot(client, signal, enabled) {
++  const resource = OPERATIONAL_SIGNALS[signal.resource];
++  if (!enabled || !resource || !signal.businessId) return null;
++  const business = await client.business.findUnique({ where: { id: signal.businessId }, select: { id: true, tenantId: true } });
++  if (!business?.tenantId) throw new Error('A verified business is required for operational sync');
++  const event = { id: `operational_${randomUUID()}`, resource, action: 'snapshot',
++    record_id: signal.recordId || null, business_id: business.id, tenant_id: business.tenantId,
++    outlet_id: signal.outletId || null, changed_at: new Date().toISOString() };
++  return client.backgroundJob.create({ data: { type: 'admincore.notify-change', payload: event, maxAttempts: 5 } });
++}
+--- a/backend/src/core/sync/sync.service.js
++++ b/backend/src/core/sync/sync.service.js
+@@ -317,25 +317,28 @@
+   return rows;
+ };
+ 
+-const listQrExportRows = async (business, limit = 250) => {
++const listQrExportRows = async (business, limit = 250, offset = 0) => {
+   const [qrCodes, sessions, scans] = await Promise.all([
+     prisma.tableQrCode.findMany({
+       where: { businessId: business.id },
+       include: { table: { include: { area: true } } },
+-      orderBy: { updatedAt: "desc" },
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+     prisma.tableSession.findMany({
+       where: { businessId: business.id },
+       include: { table: true, qrCode: true },
+-      orderBy: { updatedAt: "desc" },
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+     prisma.tableQrScanEvent.findMany({
+       where: { businessId: business.id },
+       include: { qrCode: true },
+-      orderBy: { scannedAt: "desc" },
++      orderBy: [{ scannedAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+   ]);
+ 
+@@ -407,31 +410,35 @@
+   ];
+ };
+ 
+-const listCentralKitchenRows = async (business, limit = 250) => {
++const listCentralKitchenRows = async (business, limit = 250, offset = 0) => {
+   const [purchaseOrders, allocations, routePlans, movements] = await Promise.all([
+     prisma.purchaseOrder.findMany({
+       where: { businessId: business.id },
+       include: { outlet: true, requestedBy: { select: { id: true, name: true, email: true } } },
+-      orderBy: { updatedAt: "desc" },
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+     prisma.allocation.findMany({
+       where: { businessId: business.id },
+       include: { outlet: true },
+-      orderBy: { updatedAt: "desc" },
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+     prisma.routePlan.findMany({
+       where: { businessId: business.id },
+       include: { stops: { include: { outlet: true }, orderBy: { sequence: "asc" } } },
+-      orderBy: { updatedAt: "desc" },
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+     prisma.inventoryMovement.findMany({
+       where: { businessId: business.id },
+       include: { inventoryItem: true },
+-      orderBy: { createdAt: "desc" },
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
++      skip: offset,
+     }),
+   ]);
+ 
+@@ -523,8 +530,8 @@
+ 
+ const listSupplierRows = async (business, limit = 250) => {
+   const [items, purchaseOrders] = await Promise.all([
+-    prisma.inventoryItem.findMany({ where: { businessId: business.id }, orderBy: { updatedAt: "desc" }, take: limit }),
+-    prisma.purchaseOrder.findMany({ where: { businessId: business.id }, include: { outlet: true }, orderBy: { updatedAt: "desc" }, take: limit }),
++    collectExportRows(page => prisma.inventoryItem.findMany({ where: { businessId: business.id }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: page.limit, skip: page.offset })),
++    collectExportRows(page => prisma.purchaseOrder.findMany({ where: { businessId: business.id }, include: { outlet: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: page.limit, skip: page.offset })),
+   ]);
+   const suppliers = new Map();
+   for (const item of items) {
+@@ -589,16 +596,16 @@
+   const [roles, permissions, users] = await Promise.all([
+     prisma.role.findMany({ include: { permissions: { include: { permission: true } } }, orderBy: { name: "asc" } }),
+     prisma.permission.findMany({ orderBy: { key: "asc" } }),
+-    prisma.user.findMany({
++    collectExportRows(page => prisma.user.findMany({
+       where: { businessId: business.id },
+       include: {
+         role: true,
+         permissions: { include: { permission: true } },
+         outletAssignments: { include: { outlet: true } },
+       },
+-      orderBy: { name: "asc" },
+-      take: limit,
+-    }),
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
++      take: page.limit, skip: page.offset,
++    })),
+   ]);
+   return [
+     ...roles.map((role) => ({
+@@ -656,18 +663,18 @@
+ 
+ const listAuditSecurityRows = async (business, limit = 250) => {
+   const [activities, tokens] = await Promise.all([
+-    prisma.staffActivity.findMany({
++    collectExportRows(page => prisma.staffActivity.findMany({
+       where: { user: { is: { businessId: business.id } } },
+       include: { user: { select: { id: true, name: true, email: true, role: { select: { name: true } } } } },
+-      orderBy: { createdAt: "desc" },
+-      take: limit,
+-    }),
+-    prisma.authToken.findMany({
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
++      take: page.limit, skip: page.offset,
++    })),
++    collectExportRows(page => prisma.authToken.findMany({
+       where: { user: { is: { businessId: business.id } } },
+       include: { user: { select: { id: true, name: true, email: true } } },
+-      orderBy: { createdAt: "desc" },
+-      take: limit,
+-    }),
++      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
++      take: page.limit, skip: page.offset,
++    })),
+   ]);
+   return [
+     ...activities.map((activity) => ({
+@@ -863,7 +870,8 @@
+ 
+   async exportResource({ resource, tenantId, businessId, query = {} }) {
+     const normalizedResource = normalizeResource(resource);
+-    const paginated = [...OPERATIONAL_EXPORT_RESOURCES, "products", "orders", "bills", "inventory"].includes(normalizedResource);
++    const grouped = ["qr", "central-kitchen"].includes(normalizedResource);
++    const paginated = grouped || [...OPERATIONAL_EXPORT_RESOURCES, "products", "orders", "bills", "inventory", "kot"].includes(normalizedResource);
+     const pagination = getPagination(query);
+     if (paginated) query = { ...query, limit: pagination.limit, offset: pagination.offset };
+     const limit = getSyncLimit(query.limit);
+@@ -926,47 +934,36 @@
+     } else if (normalizedResource === "tables") {
+       data = await tableManagementService.listTables({ tenantId, businessId });
+     } else if (normalizedResource === "qr") {
+-      data = await listQrExportRows(await getBusinessContext({ tenantId, businessId }), limit);
++      data = await listQrExportRows(await getBusinessContext({ tenantId, businessId }), limit, pagination.offset);
+     } else if (normalizedResource === "reservations") {
+       data = await tableManagementService.listReservations({ tenantId, businessId, includeHistory: true });
+     } else if (normalizedResource === "kot") {
+       data = await kotService.listTickets({
+         tenantId,
+         limit,
++        offset: pagination.offset,
++        ascending: true,
+         status: query.status,
+         stationId: query.station_id || query.stationId,
+       });
+     } else if (normalizedResource === "central-kitchen") {
+-      data = await listCentralKitchenRows(await getBusinessContext({ tenantId, businessId }), limit);
++      data = await listCentralKitchenRows(await getBusinessContext({ tenantId, businessId }), limit, pagination.offset);
+     } else if (normalizedResource === "taxes") {
+       const business = await getBusinessContext({ tenantId, businessId });
+-      const bills = await billingService.listInvoices({
+-        tenantId: business.tenantId,
+-        limit,
+-        page: query.page,
+-        offset: query.offset,
+-      });
++      const bills = await collectExportRows(page => billingService.listInvoices({ tenantId: business.tenantId, ...page }));
+       data = serializeTaxRows({ bills, business });
+     } else if (normalizedResource === "discounts") {
+       const business = await getBusinessContext({ tenantId, businessId });
+       const [bills, orders] = await Promise.all([
+-        billingService.listInvoices({
+-          tenantId: business.tenantId,
+-          limit,
+-          page: query.page,
+-          offset: query.offset,
+-        }),
+-        ordersService.listOrders({
+-          tenantId: business.tenantId,
+-          query: { limit, page: query.page, offset: query.offset },
+-        }),
++        collectExportRows(page => billingService.listInvoices({ tenantId: business.tenantId, ...page })),
++        collectExportRows(page => ordersService.listOrders({ tenantId: business.tenantId, query: page })),
+       ]);
+       data = serializeDiscountRows({ bills, orders, business });
+     } else if (normalizedResource === "suppliers") {
+       data = await listSupplierRows(await getBusinessContext({ tenantId, businessId }), limit);
+     } else if (normalizedResource === "expenses") {
+       const business = await getBusinessContext({ tenantId, businessId });
+-      const centralKitchenRows = await listCentralKitchenRows(business, limit);
++      const centralKitchenRows = await collectExportRows(page => listCentralKitchenRows(business, page.limit, page.offset));
+       data = centralKitchenRows
+         .filter((row) => ["purchase_order", "allocation"].includes(row.resource_type))
+         .map((row) => ({
+@@ -1063,8 +1060,8 @@
+     if (paginated) {
+       envelope.meta.pagination = {
+         limit: pagination.limit, offset: pagination.offset,
+-        has_more: items.length === pagination.limit,
+-        next_offset: pagination.offset + items.length,
++        has_more: grouped ? Object.values(items.reduce((counts, row) => { counts[row.resource_type] = (counts[row.resource_type] || 0) + 1; return counts; }, {})).some(count => count >= pagination.limit) : items.length === pagination.limit,
++        next_offset: pagination.offset + (grouped ? pagination.limit : items.length),
+       };
+     }
+     return {

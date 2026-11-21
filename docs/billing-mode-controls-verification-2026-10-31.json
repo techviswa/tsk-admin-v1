@@ -1,0 +1,60 @@
+{
+  "result": "billing_mode_controls_verified",
+  "date": "2026-10-31",
+  "scope": "Business-specific Table, Token, Pickup and Delivery controls",
+  "backend_tests": 269,
+  "final_focused_policy_worker_tests": 16,
+  "admin_ui_tests": 40,
+  "pos_ui_tests": 86,
+  "production_builds": {
+    "admincore": "passed",
+    "pos": "passed"
+  },
+  "paired_runs": [
+    {
+      "run_id": "3d3ae52c59264a9db90ace55be1cf9a7",
+      "result": "passed",
+      "billing_modes_admincore_to_pos": "passed",
+      "pos_release_suite": "passed"
+    },
+    {
+      "run_id": "8f1906329ac94971bbe76d2f7128d235",
+      "result": "passed",
+      "billing_modes_admincore_to_pos": "passed",
+      "pos_release_suite": "not_requested"
+    }
+  ],
+  "local_admin_browser": "passed; read-only business-policy verification",
+  "source_file_sha256": {
+    "admincore": {
+      "backend/server.py": "a9d99263e96ecf709a1f842491172dc3276d122d7a183512238e2f34f3409725",
+      "backend/pos_entitlements.py": "ae9ef3fa007ef5a756f7c00418c080a90c99113df0c6ba6182c524933f5bbc8b",
+      "backend/test_fulfillment_modes.py": "8598b021f741f30264f506c8b5da7b2dbb398033f8de39c678ade072136bc9f5",
+      "frontend/src/components/FulfillmentModeControls.js": "b3a2af83717f81e92e2d768ba58c16032d47e097a1157efd921065fbd915f600",
+      "frontend/src/components/FulfillmentModeControls.test.js": "c19098bef45f73c4973967a3374b8ede05d27df59c787815a981062b353f3051",
+      "frontend/src/pages/ControlCenterPage.js": "14e155f730877991194949e7ab629436460d9b38bd9cf8737ac90222ea93c188",
+      "tests/coupled_api_check.py": "27da1324b3ef9e1beb897e532cf0b7088cd66628134d08460b03e4912261c4df",
+      "tests/coupled_fixture.mjs": "91d11bb573193fa287dc949368165cb89b49277e1c6fde322dd6c0bac53ab134"
+    },
+    "pos": {
+      "frontend/src/pages/Billing.js": "380559fbeb08927bed5cbd5d0c887c597c835caa84520e063de37994e90065d0",
+      "frontend/src/pages/Billing.scope.test.js": "5e54cde521f89ecb7d335591fdce1dd9c58cbfb117d3bbb98abb49146f847eff",
+      "frontend/src/features/billing/fulfillment/components/FulfillmentModeSelector.jsx": "74f21f70d4451c79964358cefeae70eeaf292eba08122aca8617b06884b4d48d",
+      "frontend/src/features/billing/fulfillment/components/FulfillmentModeSelector.test.js": "276ce407c1c9b5e3f80a99ba8127e5b3937abbd00baa59a5037e28feb3dc0671",
+      "frontend/src/features/billing/fulfillment/pages/BillingFulfillmentSection.jsx": "d15ac41c7a9797c69f9ddeeb85f3c1334bff5cf51ef40d3c0396f3854c670386",
+      "backend/scripts/deploy-check.mjs": "d1b4bd93234464f06ddeb6c3e43885f7d6624e06a51eda466fdb97ec7b03715e",
+      "backend/scripts/fulfillment-policy-tests.mjs": "8bbb9be87d30855f0b61d2ec215a31f71650c423f44ef3989b5a52717a3016eb",
+      "backend/src/core/billing/billing.routes.js": "2accb03666fb664d68e7d0a0c888d363f53a52df4be2d12815fdb1a2de9d4a2e",
+      "backend/src/core/billing/billing.service.js": "8799b5e78dddb32fae4385e9524bc96922e7578ac54551e3ab6ad2deb59da014",
+      "backend/src/core/billing/fulfillment-policy.js": "019573436870e427bb99232ca3a7df9a481f2208d1a83589b4687be3c49c394f",
+      "backend/src/core/orders/orders.service.js": "e42cd7bf7df2f0ffafc4fcb734316a1a1108a0b3fcfd598656520d30c2339606",
+      "backend/src/core/saas/saas.service.js": "083cc0450dcb7a40e62e087230103fc425d0a18f017786860dfeebc34cdbe2b7"
+    }
+  },
+  "limits": [
+    "Hosted and physical till acceptance remain separate",
+    "Offline receipts are validated against current server policy when submitted",
+    "Existing business policies were not changed during browser verification",
+    "No commits or deployment performed"
+  ]
+}

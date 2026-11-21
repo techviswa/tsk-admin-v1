@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useBusiness } from '@/components/layout/DashboardLayout';
+import { useAuth } from '@/contexts/AuthContext';
+import { hasPlatformPermission } from '@/lib/permissions';
 import api, { formatApiDetail, formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -19,6 +21,10 @@ const PLANS = ['starter', 'pro', 'enterprise'];
 export default function BusinessesPage() {
   const navigate = useNavigate();
   const { selectBusiness, refreshBusinesses } = useBusiness();
+  const { user } = useAuth();
+  // Plans are a commercial grant: only staff with subscription rights can pick one. The server enforces this too.
+  const canSetPlan = hasPlatformPermission(user, 'subscriptions.write');
+  const canSuspend = hasPlatformPermission(user, 'businesses.suspend');
   const [businesses, setBusinesses] = useState([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -66,10 +72,10 @@ export default function BusinessesPage() {
     setSubmitting(true);
     try {
       if (editing) {
-        await api.put(`/businesses/${editing.id}`, { name: form.name, type: form.type, plan: form.plan });
+        await api.put(`/businesses/${editing.id}`, { name: form.name, type: form.type, expected_source_updated_at: editing.pos_source_updated_at, ...(canSetPlan ? { plan: form.plan } : {}) });
         toast.success('Business updated');
       } else {
-        const { data } = await api.post('/businesses', form);
+        const { data } = await api.post('/businesses', canSetPlan ? form : { ...form, plan: 'starter' });
         if (data.pos_provisioning_status === 'synced' || data.pos_provisioned) {
           toast.success('Business created and POS provisioning completed');
         } else {
@@ -88,6 +94,18 @@ export default function BusinessesPage() {
     }
   };
 
+  const handleStatusChange = async (biz) => {
+    const next = biz.status === 'suspended' ? 'active' : 'suspended';
+    const reason = window.prompt(`${next === 'suspended' ? 'Suspend' : 'Reactivate'} "${biz.name}"? Enter a reason (recorded in the audit log):`);
+    if (!reason) return;
+    try {
+      await api.put(`/businesses/${biz.id}`, { status: next, reason });
+      toast.success(next === 'suspended' ? 'Business suspended' : 'Business reactivated');
+      fetchBusinesses();
+      refreshBusinesses();
+    } catch (err) { toast.error(formatApiError(err)); }
+  };
+
   const handleDelete = async (biz) => {
     if (!window.confirm(`Delete "${biz.name}"? This will remove all related data.`)) return;
     try {
@@ -103,7 +121,7 @@ export default function BusinessesPage() {
     navigate(path);
   };
 
-  const statusColor = (s) => s === 'active' ? 'bg-emerald-100 text-emerald-700 border-emerald-200' : 'bg-zinc-100 text-zinc-600 border-zinc-200';
+  const statusColor = (s) => s === 'active' ? 'bg-emerald-100 text-emerald-700 border-emerald-200' : s === 'suspended' ? 'bg-amber-100 text-amber-700 border-amber-200' : 'bg-zinc-100 text-zinc-600 border-zinc-200';
   const posStatusColor = (status) => {
     if (status === 'synced' || status === 'connected') return 'bg-emerald-100 text-emerald-700 border-emerald-200';
     if (status === 'pending') return 'bg-amber-100 text-amber-700 border-amber-200';
@@ -177,8 +195,8 @@ export default function BusinessesPage() {
                 <TableCell className="py-3"><Badge className={`text-[11px] ${statusColor(biz.operational_ready === false ? 'pending' : biz.status)}`}>{biz.operational_ready === false && biz.status === 'active' ? 'Not ready' : biz.status}</Badge></TableCell>
                 <TableCell className="py-3">
                   <div className="space-y-1">
-                    <Badge className={`text-[11px] ${posStatusColor(biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not_configured'))}`}>
-                      {biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not configured')}
+                    <Badge className={`text-[11px] ${posStatusColor(biz.pos_connection_state === 'setup_required' ? 'pending' : biz.pos_provisioning_status || (biz.pos_synced ? 'synced' : 'not_configured'))}`}>
+                      {biz.pos_connection_state === 'setup_required' ? 'Connection needs review' : biz.pos_provisioning_status || (biz.pos_synced ? 'connected' : 'not configured')}
                     </Badge>
                     {biz.pos_provisioning_step && (
                       <p className="text-[11px] text-zinc-600">
@@ -217,7 +235,8 @@ export default function BusinessesPage() {
                       <DropdownMenuItem onClick={() => openOperation(biz, '/settings')}><Settings className="h-3.5 w-3.5 mr-2" />Settings</DropdownMenuItem>
                       <DropdownMenuItem onClick={() => openRetryProvision(biz)} disabled={retryingId === biz.id}><RefreshCw className="h-3.5 w-3.5 mr-2" />Retry POS Provision</DropdownMenuItem>
                       <DropdownMenuItem onClick={() => openEdit(biz)}><Pencil className="h-3.5 w-3.5 mr-2" />Edit</DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => handleDelete(biz)} className="text-red-600 focus:text-red-600"><Trash2 className="h-3.5 w-3.5 mr-2" />Delete</DropdownMenuItem>
+                      {canSuspend && <DropdownMenuItem onClick={() => handleStatusChange(biz)}><Shield className="h-3.5 w-3.5 mr-2" />{biz.status === 'suspended' ? 'Reactivate' : 'Suspend'}</DropdownMenuItem>}
+                      {user?.role === 'platform_admin' && <DropdownMenuItem onClick={() => handleDelete(biz)} className="text-red-600 focus:text-red-600"><Trash2 className="h-3.5 w-3.5 mr-2" />Delete</DropdownMenuItem>}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </TableCell>
@@ -236,6 +255,15 @@ export default function BusinessesPage() {
             <div className="space-y-2">
               <Label>Business Name</Label>
               <Input value={form.name} onChange={e => setForm({...form, name: e.target.value})} placeholder="e.g. My Restaurant" required data-testid="business-name-input" />
+              {editing?.pos_profile ? <div className="rounded-md border bg-slate-50 p-3 text-sm">
+                <p className="font-medium">Shop details from POS</p>
+                <dl className="mt-2 space-y-1 text-slate-600">
+                  <div><dt className="inline font-medium">GST: </dt><dd className="inline">{editing.pos_profile.gst || 'Not provided'}</dd></div>
+                  <div><dt className="inline font-medium">Phone: </dt><dd className="inline">{editing.pos_profile.phone || 'Not provided'}</dd></div>
+                  <div><dt className="inline font-medium">Address: </dt><dd className="inline break-words">{editing.pos_profile.address || 'Not provided'}</dd></div>
+                </dl>
+                <p className="mt-2 text-xs text-slate-500">Update these shop details in POS Settings. Outlet contact details are managed separately.</p>
+              </div> : null}
             </div>
             <div className="space-y-2">
               <Label>Business Type</Label>
@@ -246,15 +274,17 @@ export default function BusinessesPage() {
                 </SelectContent>
               </Select>
             </div>
-            <div className="space-y-2">
-              <Label>Plan</Label>
-              <Select value={form.plan} onValueChange={v => setForm({...form, plan: v})}>
-                <SelectTrigger data-testid="business-plan-select"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {PLANS.map(p => <SelectItem key={p} value={p} className="capitalize">{p}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
+            {canSetPlan && (
+              <div className="space-y-2">
+                <Label>Plan</Label>
+                <Select value={form.plan} onValueChange={v => setForm({...form, plan: v})}>
+                  <SelectTrigger data-testid="business-plan-select"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {PLANS.map(p => <SelectItem key={p} value={p} className="capitalize">{p}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             {!editing && (
               <div className="space-y-4 border-t border-zinc-200 pt-4">
                 <div>

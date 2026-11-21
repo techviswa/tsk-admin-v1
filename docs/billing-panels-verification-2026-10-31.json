@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-31",
+  "result": "settlement_and_qr_panels_verified",
+  "frontend_tests": 92,
+  "production_frontend_build": "passed",
+  "isolated_api_acceptance": {
+    "result": "passed",
+    "run_id": "dbef2fb3fab54e809f66f58f671ac772",
+    "billing_panels": "passed",
+    "scope": "105 scoped/searchable settlements, immutable closure/replay and 25 authenticated QR requests across pages; disposable databases only"
+  },
+  "restricted_cashier_http_scope": "passed; omitted outlet stays scoped, other-outlet requests return 403",
+  "browser_sizes": [
+    1440,
+    768,
+    390,
+    320
+  ],
+  "browser_scope": "Actual component markup with compiled CSS; mocked data; screenshots visually inspected",
+  "pos_source_sha256": {
+    "frontend/src/App.css": "8a6ba5fd1158b81e747a2716787c6e5e28b92142f78d5771ecf665876a68b1e0",
+    "frontend/src/components/QrCheckoutInbox.jsx": "be0048d6e0b209ab55984797ceb7a05974f530dda970088fb9e3325531322e01",
+    "frontend/src/components/QrCheckoutInbox.test.js": "90a279b168dc55ecbadf49ed8f95937028579765698582dfdd10755340a106c8",
+    "frontend/src/pages/Billing.js": "41c6b441f37c43cb0be03b529bdd10bb4104be257df8a8832cae8dce7a87beb1",
+    "frontend/src/core/billing/components/CashierSettlement.jsx": "0af6c5edca52e883a7df2d2259130790428823267daf94059a6dc017721ec9ce",
+    "frontend/src/core/billing/components/CashierSettlement.test.js": "42f2faa7626678a0be9dc82ebae0c2163a1d098c46fad5f862d32d44a5ab0333",
+    "backend/src/features/sales-extensions/qr-ordering/qr-ordering.routes.js": "468a8d0796b92894a2febc48544fbb2b7de9d634276c213ad6abc3fcb42762bb",
+    "backend/src/core/billing/billing.controller.js": "e12c86a795e5def13551493c2188c355c1a4770953d52674dc4eb4fab84e4ca3",
+    "backend/src/core/billing/billing.service.js": "4504c34bc031030b1566e04a2cfa58472e5e3d3cb8dca18dda1472f313d457d8",
+    "backend/src/core/billing/settlement.service.js": "d685b6f937b7106dd1d944fbef2546d2ea3ddd2d41246cf0133bc754cb5573ac"
+  },
+  "limits": [
+    "No physical till/payment-provider acceptance performed",
+    "Financial rules preserved; existing source settlement transactions/locks remain authoritative",
+    "No existing business data removed, no database migration, no deployment"
+  ]
+}

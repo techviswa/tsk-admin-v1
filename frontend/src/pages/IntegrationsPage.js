@@ -20,20 +20,22 @@ export default function IntegrationsPage() {
   const { selectedBusiness } = useBusiness();
   const [integrations, setIntegrations] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [sheetOpen, setSheetOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ slug: '', name: '', type: 'payment' });
 
-  const fetchIntegrations = useCallback(async () => {
+  const fetchIntegrations = useCallback(async (signal) => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
-      const { data } = await api.get(`/integrations/business/${selectedBusiness.id}`);
-      setIntegrations(data);
-    } catch { toast.error('Failed to load integrations'); }
-    finally { setLoading(false); }
+      setError('');
+      const { data } = await api.get(`/integrations/business/${selectedBusiness.id}`, { signal });
+      if (!signal?.aborted) setIntegrations(data);
+    } catch (err) { if (!signal?.aborted) setError(formatApiError(err)); }
+    finally { if (!signal?.aborted) setLoading(false); }
   }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchIntegrations(); }, [fetchIntegrations]);
+  useEffect(() => { const controller = new AbortController(); setLoading(true); setIntegrations([]); setSheetOpen(false); fetchIntegrations(controller.signal); return () => controller.abort(); }, [fetchIntegrations]);
 
   if (!selectedBusiness) {
     return (
@@ -93,11 +95,12 @@ export default function IntegrationsPage() {
         </Button>
       </div>
 
+      {error && <div role="alert" className="rounded border p-3 text-sm text-red-700">Integrations could not load: {error} <Button variant="outline" size="sm" onClick={() => fetchIntegrations()}>Retry</Button></div>}
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {[1,2,3].map(i => <div key={i} className="h-32 bg-zinc-200 rounded-lg animate-pulse" />)}
         </div>
-      ) : integrations.length === 0 ? (
+      ) : error ? null : integrations.length === 0 ? (
         <div className="text-center py-16 text-zinc-400">
           <Plug className="h-10 w-10 mx-auto mb-3 opacity-40" />
           <p className="text-sm">No integrations configured yet</p>

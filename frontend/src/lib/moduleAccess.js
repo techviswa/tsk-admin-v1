@@ -1,4 +1,7 @@
+import { POS_OPERATIONS } from './posOperations';
+
 export const POS_RESOURCE_MODULES = {
+  ...Object.fromEntries(Object.entries(POS_OPERATIONS).map(([key, value]) => [key, value.module])),
   'sales-orders': 'pos',
   payments: 'payments',
   bills: 'billing',

@@ -1,7 +1,9 @@
 import { useState, createContext, useContext, useEffect, useCallback, useRef } from 'react';
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
+import { isPlatformStaff } from '@/lib/permissions';
 import api from '@/lib/api';
+import DevelopmentEnvironment from '@/components/DevelopmentEnvironment';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
@@ -21,7 +23,7 @@ const NAV_ITEMS = [
   { label: 'Overview', icon: LayoutDashboard, path: '/' },
   { label: 'Control Center', icon: Store, path: '/control-center' },
   { type: 'separator', label: 'Management' },
-  { label: 'Clients', icon: Users, path: '/clients' },
+  { label: 'Owner contacts', icon: Users, path: '/clients' },
   { label: 'Businesses', icon: Building2, path: '/businesses' },
   { label: 'Outlets', icon: MapPin, path: '/outlets', moduleSlug: ROUTE_MODULES['/outlets'] },
   { label: 'Products', icon: Package, path: '/products', moduleSlug: ROUTE_MODULES['/products'] },
@@ -40,6 +42,8 @@ const NAV_ITEMS = [
   { label: 'Audit Logs', icon: Activity, path: '/audit-logs', moduleSlug: ROUTE_MODULES['/audit-logs'] },
   { label: 'Integrations', icon: Plug, path: '/integrations', moduleSlug: ROUTE_MODULES['/integrations'] },
   { label: 'POS Bridge', icon: Plug, path: '/pos-bridge', moduleSlug: ROUTE_MODULES['/pos-bridge'] },
+  { type: 'separator', label: 'Account' },
+  { label: 'Security', icon: Shield, path: '/security' },
 ];
 
 export default function DashboardLayout() {
@@ -47,8 +51,10 @@ export default function DashboardLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const [businesses, setBusinesses] = useState([]);
+  const [businessesLoaded, setBusinessesLoaded] = useState(false);
   const [selectedBusiness, setSelectedBusiness] = useState(null);
   const [businessModules, setBusinessModules] = useState([]);
+  const [posResources, setPosResources] = useState(null);
   const [modulesLoading, setModulesLoading] = useState(false);
   const moduleRequest = useRef(0);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -58,26 +64,46 @@ export default function DashboardLayout() {
     try {
       const { data } = await api.get('/businesses');
       setBusinesses(data);
+      setBusinessesLoaded(true);
+      setSelectedBusiness(current => {
+        if (!current) return null;
+        const refreshed = data.find(business => business.id === current.id);
+        if (!refreshed) localStorage.removeItem('selectedBusinessId');
+        return refreshed && JSON.stringify(refreshed) === JSON.stringify(current) ? current : refreshed || null;
+      });
     } catch (err) {
       console.error('Failed to fetch businesses', err);
     }
   }, []);
 
-  useEffect(() => { fetchBusinesses(); }, [fetchBusinesses]);
+  useEffect(() => {
+    fetchBusinesses();
+    const refresh = () => { if (document.visibilityState !== 'hidden') fetchBusinesses(); };
+    const timer = window.setInterval(refresh, 30000);
+    window.addEventListener('focus', refresh);
+    return () => { window.clearInterval(timer); window.removeEventListener('focus', refresh); };
+  }, [fetchBusinesses]);
 
   const fetchBusinessModules = useCallback(async () => {
     const requestId = ++moduleRequest.current;
     if (!selectedBusiness?.id) {
       setBusinessModules([]);
+      setPosResources(null);
       setModulesLoading(false);
       return;
     }
     setModulesLoading(true);
     try {
-      const { data } = await api.get(`/modules/business/${selectedBusiness.id}`);
-      if (requestId === moduleRequest.current) setBusinessModules(data || []);
+      const [modules, resources] = await Promise.allSettled([
+        api.get(`/modules/business/${selectedBusiness.id}`),
+        api.get('/pos-admin/resources', { params: { business_id: selectedBusiness.id } }),
+      ]);
+      if (requestId === moduleRequest.current) {
+        setBusinessModules(modules.status === 'fulfilled' ? modules.value.data || [] : []);
+        setPosResources(new Set(resources.status === 'fulfilled' ? (resources.value.data || []).map(row => row.key) : []));
+      }
     } catch {
-      if (requestId === moduleRequest.current) setBusinessModules([]);
+      if (requestId === moduleRequest.current) { setBusinessModules([]); setPosResources(new Set()); }
     } finally {
       if (requestId === moduleRequest.current) setModulesLoading(false);
     }
@@ -90,6 +116,7 @@ export default function DashboardLayout() {
   const selectBusiness = (biz) => {
     moduleRequest.current += 1;
     setBusinessModules([]);
+    setPosResources(new Set());
     setModulesLoading(Boolean(biz));
     setSelectedBusiness(biz);
     if (biz?.id) localStorage.setItem('selectedBusinessId', biz.id);
@@ -101,14 +128,15 @@ export default function DashboardLayout() {
     navigate('/login');
   };
 
-  const moduleEnabled = (moduleSlug) => !selectedBusiness || modulesLoading || user?.role === 'platform_admin' || hasModule(moduleSet, moduleSlug);
+  const moduleEnabled = (moduleSlug) => !selectedBusiness || modulesLoading || isPlatformStaff(user) || hasModule(moduleSet, moduleSlug);
+  const navEnabled = item => moduleEnabled(item.moduleSlug) && (!item.path?.startsWith('/pos-admin/') || posResources === null || posResources.has(item.path.split('/').pop()));
   const visibleNavItems = NAV_ITEMS.filter((item, index, items) => {
     if (item.type !== 'separator') {
-      return moduleEnabled(item.moduleSlug);
+      return navEnabled(item);
     }
     const nextSeparatorIndex = items.findIndex((next, nextIndex) => nextIndex > index && next.type === 'separator');
     const sectionItems = items.slice(index + 1, nextSeparatorIndex === -1 ? items.length : nextSeparatorIndex);
-    return sectionItems.some(next => next.type !== 'separator' && moduleEnabled(next.moduleSlug));
+    return sectionItems.some(next => next.type !== 'separator' && navEnabled(next));
   });
 
   const NavContent = () => (
@@ -146,7 +174,7 @@ export default function DashboardLayout() {
   );
 
   return (
-    <BusinessContext.Provider value={{ businesses, selectedBusiness, selectBusiness, clearBusiness: () => selectBusiness(null), refreshBusinesses: fetchBusinesses, businessModules, refreshBusinessModules: fetchBusinessModules, modulesLoading, moduleSet, isModuleEnabled: moduleEnabled }}>
+    <BusinessContext.Provider value={{ businesses, businessesLoaded, selectedBusiness, selectBusiness, clearBusiness: () => selectBusiness(null), refreshBusinesses: fetchBusinesses, businessModules, refreshBusinessModules: fetchBusinessModules, modulesLoading, moduleSet, isModuleEnabled: moduleEnabled }}>
       <div className="min-h-screen bg-[#F4F4F5]">
         {/* Top Navigation */}
         <header className="h-14 fixed top-0 w-full bg-white/90 backdrop-blur-lg border-b border-zinc-200 z-50 flex items-center px-4 md:px-6" data-testid="top-nav">
@@ -165,7 +193,7 @@ export default function DashboardLayout() {
             </SheetContent>
           </Sheet>
 
-          <div className="flex items-center gap-2 mr-4">
+          <div className="flex shrink-0 items-center gap-2 mr-2 md:mr-4">
             <Store className="h-5 w-5 text-blue-600" />
             <span className="font-heading font-semibold text-zinc-900 hidden sm:inline" data-testid="platform-logo">AdminCore</span>
           </div>
@@ -173,7 +201,7 @@ export default function DashboardLayout() {
           {businesses.length > 0 && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="outline" className="gap-2 h-8 text-sm border-zinc-200 shadow-sm" data-testid="business-switcher">
+                <Button variant="outline" className="min-w-0 gap-2 h-8 text-sm border-zinc-200 shadow-sm" data-testid="business-switcher">
                   <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: selectedBusiness?.branding?.primary_color || '#0055FF' }} />
                   <span className="max-w-[160px] truncate">{selectedBusiness?.name || 'All businesses'}</span>
                   <ChevronDown className="h-3 w-3 opacity-40" />
@@ -218,7 +246,7 @@ export default function DashboardLayout() {
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" className="gap-2 h-8 text-sm" data-testid="user-menu">
+              <Button variant="ghost" className="shrink-0 gap-2 h-8 text-sm" data-testid="user-menu">
                 <div className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center">
                   <span className="text-[10px] font-semibold text-white">{user?.name?.[0]?.toUpperCase() || 'U'}</span>
                 </div>
@@ -252,6 +280,8 @@ export default function DashboardLayout() {
         {/* Main Content */}
         <main className="pt-14 md:pl-64 min-h-screen">
           <div className="max-w-7xl mx-auto p-4 md:p-8 space-y-8">
+            <DevelopmentEnvironment />
+            {selectedBusiness?.pos_connection_state === 'setup_required' && <div role="alert" className="rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">This business's POS connection needs review. Stored records are preserved; automatic POS refresh is paused until setup is complete. <Link to="/businesses" className="underline font-medium">Review business connection</Link></div>}
             <Outlet key={selectedBusiness?.id || 'platform'} />
           </div>
         </main>

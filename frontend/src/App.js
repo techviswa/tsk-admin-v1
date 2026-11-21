@@ -1,7 +1,9 @@
 import "@/App.css";
-import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import { isPlatformStaff } from "@/lib/permissions";
 import { Toaster } from "@/components/ui/sonner";
+import SecurityPage from "@/pages/SecurityPage";
 import { Lock } from "lucide-react";
 import LoginPage from "@/pages/LoginPage";
 import DashboardLayout, { useBusiness } from "@/components/layout/DashboardLayout";
@@ -20,11 +22,14 @@ import IntegrationsPage from "@/pages/IntegrationsPage";
 import PlansPage from "@/pages/PlansPage";
 import SubscriptionsPage from "@/pages/SubscriptionsPage";
 import POSAdminPage from "@/pages/POSAdminPage";
+import POSOperationsPage from "@/pages/POSOperationsPage";
+import { POS_OPERATIONS } from "@/lib/posOperations";
 import POSBridgePage from "@/pages/POSBridgePage";
 import { POS_RESOURCE_MODULES, ROUTE_MODULES } from "@/lib/moduleAccess";
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
+  const location = useLocation();
   if (loading) {
     return (
       <div className="min-h-screen bg-zinc-50 flex items-center justify-center">
@@ -36,6 +41,8 @@ function ProtectedRoute({ children }) {
     );
   }
   if (user === false) return <Navigate to="/login" replace />;
+  // Mandatory MFA: an unenrolled platform account can only reach the enrollment page.
+  if (user?.mfa_enrollment_required && location.pathname !== '/security') return <Navigate to="/security" replace />;
   return children;
 }
 
@@ -63,7 +70,7 @@ function ModuleGate({ moduleSlug, children }) {
       </div>
     );
   }
-  if (selectedBusiness && user?.role !== 'platform_admin' && !isModuleEnabled(moduleSlug)) {
+  if (selectedBusiness && !isPlatformStaff(user) && !isModuleEnabled(moduleSlug)) {
     return <LockedModule moduleSlug={moduleSlug} />;
   }
   return children;
@@ -73,7 +80,7 @@ function POSAdminGate() {
   const { resource } = useParams();
   return (
     <ModuleGate moduleSlug={POS_RESOURCE_MODULES[resource]}>
-      <POSAdminPage />
+      {POS_OPERATIONS[resource] ? <POSOperationsPage /> : <POSAdminPage />}
     </ModuleGate>
   );
 }
@@ -98,6 +105,7 @@ function App() {
             <Route path="audit-logs" element={<ModuleGate moduleSlug={ROUTE_MODULES['/audit-logs']}><AuditLogsPage /></ModuleGate>} />
             <Route path="integrations" element={<ModuleGate moduleSlug={ROUTE_MODULES['/integrations']}><IntegrationsPage /></ModuleGate>} />
             <Route path="pos-bridge" element={<ModuleGate moduleSlug={ROUTE_MODULES['/pos-bridge']}><POSBridgePage /></ModuleGate>} />
+            <Route path="security" element={<SecurityPage />} />
             <Route path="plans" element={<PlansPage />} />
             <Route path="subscriptions" element={<ModuleGate moduleSlug={ROUTE_MODULES['/subscriptions']}><SubscriptionsPage /></ModuleGate>} />
             <Route path="pos-admin/:resource" element={<POSAdminGate />} />

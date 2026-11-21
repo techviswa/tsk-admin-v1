@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-01",
+  "result": "passed",
+  "fix": "Require an existing business-scoped snapshot before accessing outlet pagination state",
+  "admin_frontend_tests": 44,
+  "production_build": "passed",
+  "live_browser_checks": [
+    "No selected business on direct navigation",
+    "Selected business loads saved outlets",
+    "Return to All businesses",
+    "No runtime or API errors"
+  ],
+  "business_records_changed": false,
+  "source_sha256": {
+    "frontend/src/pages/OutletsPage.js": "972f6fdc1b816663603748dac8504dd22a8b3882216265e7ccaee021f003445e",
+    "frontend/src/pages/OutletsPage.test.js": "134b995646f48b1c29a8e954d6f7e77b2c03595779d4974ea22782bdb32b5053"
+  }
+}

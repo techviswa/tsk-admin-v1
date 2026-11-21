@@ -1,0 +1,644 @@
+--- a/backend/scripts/change-notification-tests.mjs
++++ b/backend/scripts/change-notification-tests.mjs
+@@ -34,7 +34,7 @@
+   assert.ok(events.every((event) => event.businessId === businessId && event.tenantId === tenantId));
+   await prisma.product.createMany({ data: [1, 2, 3].map((i) => ({ businessId, name: `Paged ${i}`, category: "test", price: i })) });
+   const first = await syncService.exportResource({ resource: "products", tenantId, businessId, query: { limit: 2 } });
+-  const second = await syncService.exportResource({ resource: "products", tenantId, businessId, query: { limit: 2, offset: first.meta.pagination.next_offset } });
++  const second = await syncService.exportResource({ resource: "products", tenantId, businessId, query: { limit: 2, offset: first.meta.pagination.next_offset, cursor: first.meta.pagination.next_cursor } });
+   assert.equal(first.meta.pagination.has_more, true);
+   assert.equal(second.meta.pagination.has_more, false);
+   assert.equal(new Set([...first.items, ...second.items].map((row) => row.id)).size, 3);
+--- a/backend/scripts/deploy-check.mjs
++++ b/backend/scripts/deploy-check.mjs
+@@ -49,6 +49,8 @@
+   "node scripts/production-flow-tests.mjs",
+   "node scripts/admincore-reliability-tests.mjs",
+   "node --test scripts/operational-export-tests.mjs",
++  "node --test scripts/export-cursor-tests.mjs",
++  "node scripts/export-cursor-database-tests.mjs",
+   "node scripts/sync-reconciliation-tests.mjs",
+   "node scripts/payment-isolation-tests.mjs",
+   "node scripts/submitted-payment-tests.mjs",
+--- /dev/null
++++ b/backend/scripts/export-cursor-database-tests.mjs
+@@ -0,0 +1,51 @@
++import assert from 'node:assert/strict';
++import { randomUUID } from 'node:crypto';
++import prisma from '../src/database/prisma/client.js';
++import { connectDatabase } from '../src/config/db.js';
++import { runTenantScope } from '../src/database/prisma/tenant-context.js';
++import { syncService } from '../src/core/sync/sync.service.js';
++
++const businessId = `export-cursor-check-${randomUUID()}`, tenantId = `tenant-${businessId}`;
++const scoped = fn => runTenantScope({ businessId, tenantId }, fn);
++const prefix = randomUUID();
++const nextPage = (resource, previous) => syncService.exportResource({ resource, tenantId, businessId,
++  query: { limit: 1, offset: previous.meta.pagination.next_offset, cursor: previous.meta.pagination.next_cursor } });
++try {
++  await connectDatabase();
++  await prisma.business.create({ data: { id: businessId, tenantId, name: 'Isolated cursor check' } });
++  await scoped(async () => {
++    await prisma.product.createMany({ data: ['a', 'b', 'c'].map(id => ({ id: `${prefix}-${id}`, businessId, name: `Fixture ${id}`, category: 'Test', price: 10, stock: 2 })) });
++    let page = await syncService.exportResource({ resource: 'products', tenantId, businessId, query: { limit: 1 } });
++    assert.equal(page.items[0].id, `${prefix}-a`);
++    await prisma.product.deleteMany({ where: { id: `${prefix}-a`, businessId } });
++    await prisma.product.update({ where: { id: `${prefix}-b` }, data: { name: 'Changed while paging' } });
++    await prisma.product.create({ data: { id: `${prefix}-z`, businessId, name: 'Next export', category: 'Test', price: 10, stock: 2 } });
++    page = await nextPage('products', page);
++    assert.equal(page.items[0].id, `${prefix}-b`);
++    assert.equal(page.items[0].name, 'Changed while paging');
++    page = await nextPage('products', page);
++    assert.equal(page.items[0].id, `${prefix}-c`);
++    assert.equal(page.meta.pagination.has_more, false);
++    assert.equal(page.meta.pagination.complete_scope, true);
++    for (const id of ['a', 'b', 'c']) await prisma.customer.create({ data: { id: `${prefix}-customer-${id}`, businessId, name: `Fixture ${id}`, phone: `fixture-${prefix}-${id}` } });
++    page = await syncService.exportResource({ resource: 'loyalty-customers', tenantId, businessId, query: { limit: 1 } });
++    await prisma.customer.deleteMany({ where: { id: `${prefix}-customer-a`, businessId } });
++    page = await nextPage('loyalty-customers', page);
++    assert.equal(page.items[0].id, `${prefix}-customer-b`);
++    for (const id of ['a', 'b']) await prisma.stateDocument.create({ data: { key: `assistance:${businessId}:${id}`, data: { id, business_id: businessId, table_name: 'Fixture', kind: 'water', status: 'resolved', created_at: new Date().toISOString() } } });
++    page = await syncService.exportResource({ resource: 'table-assistance', tenantId, businessId, query: { limit: 1 } });
++    assert.equal(page.items[0].id, 'a');
++    await prisma.stateDocument.deleteMany({ where: { key: `assistance:${businessId}:a` } });
++    page = await nextPage('table-assistance', page);
++    assert.equal(page.items[0].id, 'b');
++    assert.equal(page.meta.pagination.has_more, false);
++  });
++  console.log('Database cursor checks passed: product/customer deletion during paging, live updates, fixed upper bounds and scoped state-document keys');
++} finally {
++  await scoped(async () => {
++    await prisma.stateDocument.deleteMany({ where: { data: { path: ['business_id'], equals: businessId } } });
++    await prisma.adminCoreSyncLog.deleteMany({ where: { tenantId } });
++    await prisma.business.deleteMany({ where: { id: businessId } });
++  });
++  await prisma.$disconnect();
++}
+--- /dev/null
++++ b/backend/scripts/export-cursor-tests.mjs
+@@ -0,0 +1,77 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { EXPORT_CURSOR, beginExportCursor, readExportPage, finishExportCursor } from '../src/shared/utils/export-cursor.js';
++
++const business = { id: 'a', tenantId: 'tenant-a' }, secret = 'isolated-export-signing-key';
++const begin = (query = {}, extra = {}) => beginExportCursor({ business, resource: 'tips', query, limit: 1, offset: 0, secret, ...extra });
++const delegate = (rows, idField = 'id') => {
++  const matches = (row, where = {}) => Object.entries(where).every(([key, value]) => {
++    if (key === 'AND') return value.every(part => matches(row, part));
++    if (value && typeof value === 'object') return Object.entries(value).every(([operator, bound]) => operator === 'gt' ? row[key] > bound : operator === 'lte' ? row[key] <= bound : operator === 'startsWith' ? row[key].startsWith(bound) : false);
++    return row[key] === value;
++  });
++  const ordered = (where, reverse = false) => rows.filter(row => matches(row, where)).sort((a, b) => a[idField] < b[idField] ? (reverse ? 1 : -1) : a[idField] > b[idField] ? (reverse ? -1 : 1) : 0);
++  return {
++    findFirst: async args => ordered(args.where, args.orderBy[idField] === 'desc')[0] || null,
++    findMany: async args => ordered(args.where).slice(args.skip || 0, (args.skip || 0) + args.take),
++  };
++};
++
++test('deleting an earlier row and editing a later row cannot skip that later row', async () => {
++  const rows = ['a', 'b', 'c'].map(id => ({ id, businessId: 'a', name: id }));
++  const model = delegate(rows), args = { where: { businessId: 'a' }, take: 1, skip: 0 };
++  let context = begin();
++  assert.equal((await readExportPage(model, args, { [EXPORT_CURSOR]: context }))[0].id, 'a');
++  let page = finishExportCursor(context);
++  rows.shift(); rows[0].name = 'Updated during export'; rows.push({ id: 'z', businessId: 'a' });
++  context = begin({ cursor: page.next_cursor }, { offset: page.next_offset });
++  const second = await readExportPage(model, args, { [EXPORT_CURSOR]: context });
++  assert.equal(second[0].id, 'b'); assert.equal(second[0].name, 'Updated during export');
++  page = finishExportCursor(context);
++  context = begin({ cursor: page.next_cursor }, { offset: page.next_offset });
++  assert.equal((await readExportPage(model, args, { [EXPORT_CURSOR]: context }))[0].id, 'c');
++  assert.equal(finishExportCursor(context).has_more, false, 'New rows beyond the original bound belong to the next export');
++});
++
++test('continuations reject tampering, a different tenant/resource/filter, expiry and skipped pages', async () => {
++  const context = begin();
++  await readExportPage(delegate([{ id: 'a' }, { id: 'b' }]), { take: 1 }, { [EXPORT_CURSOR]: context });
++  const page = finishExportCursor(context), query = { cursor: page.next_cursor };
++  for (const extra of [{ business: { id: 'other', tenantId: 'other' } }, { resource: 'payroll' }, { offset: 2 }, { now: Date.now() + 16 * 60000 }]) {
++    assert.throws(() => begin(query, { offset: 1, ...extra }), error => error.code === 'EXPORT_CURSOR_INVALID');
++  }
++  assert.throws(() => begin({ ...query, status: 'active' }, { offset: 1 }), /scope or page changed/);
++  assert.throws(() => begin({ cursor: page.next_cursor + 'x' }, { offset: 1 }), /Invalid export continuation/);
++  const [payload, signed] = page.next_cursor.split('.');
++  assert.throws(() => begin({ cursor: `${payload}.${'é'.repeat(signed.length)}` }, { offset: 1 }), error => error.code === 'EXPORT_CURSOR_INVALID');
++  assert.throws(() => begin({}, { offset: 1 }), /required after the first page/);
++});
++
++test('grouped exports maintain separate positions without repeating smaller groups', async () => {
++  const first = delegate([{ id: 'a1' }, { id: 'a2' }]), second = delegate([{ id: 'b1' }]);
++  let context = begin();
++  await readExportPage(first, { take: 1 }, { [EXPORT_CURSOR]: context }, { group: 'first' });
++  await readExportPage(second, { take: 1 }, { [EXPORT_CURSOR]: context }, { group: 'second' });
++  const page = finishExportCursor(context, { grouped: true });
++  context = begin({ cursor: page.next_cursor }, { offset: page.next_offset });
++  assert.equal((await readExportPage(first, { take: 1 }, { [EXPORT_CURSOR]: context }, { group: 'first' }))[0].id, 'a2');
++  assert.deepEqual(await readExportPage(second, { take: 1 }, { [EXPORT_CURSOR]: context }, { group: 'second' }), []);
++  assert.equal(finishExportCursor(context, { grouped: true }).has_more, false);
++});
++
++test('progress follows raw rows even when a projection filters every visible row', async () => {
++  const context = begin({ status: 'active' });
++  await readExportPage(delegate([{ id: 'a' }, { id: 'b' }]), { take: 1 }, { [EXPORT_CURSOR]: context });
++  const page = finishExportCursor(context);
++  assert.equal(page.has_more, true); assert.equal(page.next_offset, 1);
++  assert.equal(page.complete_scope, false, 'Filtered results cannot infer absent business records');
++});
++
++test('state-document keys can advance without relying on mutable timestamps', async () => {
++  const model = delegate([{ key: 'assistance:a:1' }, { key: 'assistance:a:2' }], 'key');
++  let context = begin();
++  await readExportPage(model, { where: { key: { startsWith: 'assistance:a:' } }, take: 1 }, { [EXPORT_CURSOR]: context }, { idField: 'key' });
++  const page = finishExportCursor(context);
++  context = begin({ cursor: page.next_cursor }, { offset: 1 });
++  assert.equal((await readExportPage(model, { take: 1 }, { [EXPORT_CURSOR]: context }, { idField: 'key' }))[0].key, 'assistance:a:2');
++});
+--- a/backend/src/core/admincore/admincore.routes.js
++++ b/backend/src/core/admincore/admincore.routes.js
+@@ -48,7 +48,7 @@
+ 
+ router.get("/connection", asyncHandler(getConnection));
+ router.get("/health", asyncHandler(getHealth));
+-router.get("/capabilities", requireAdmincoreBridgeKey, (_req, res) => res.json({ success: true, data: { product_commands: 1, outlet_commands: 1, export_paging: 2 } }));
++router.get("/capabilities", requireAdmincoreBridgeKey, (_req, res) => res.json({ success: true, data: { product_commands: 1, outlet_commands: 1, export_paging: 3 } }));
+ router.post("/sync-status", requireAdmincoreBridgeKey, asyncHandler(postSyncStatus));
+ router.post("/tenants", requireAdmincoreBridgeKey, asyncHandler(postSaasTenant));
+ router.post("/staff", requireAdmincoreBridgeKey, asyncHandler(postBridgeStaff));
+--- a/backend/src/core/billing/billing.service.js
++++ b/backend/src/core/billing/billing.service.js
+@@ -1,3 +1,4 @@
++import { readExportPage } from "../../shared/utils/export-cursor.js";
+ import prisma from "../../database/prisma/client.js";
+ import { Prisma } from "@prisma/client";
+ import { nextDocumentSequence } from "../../database/prisma/document-sequence.js";
+@@ -114,19 +115,19 @@
+     };
+   }
+ 
+-  async listInvoices({ tenantId, limit, page, offset, outletIds = null, from, to }) {
++  async listInvoices({ tenantId, limit, page, offset, outletIds = null, from, to, query = {} }) {
+     const business = await ensureBusiness({ tenantId });
+     for (const value of [from, to]) if (value && (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value)) throw createHttpError({ statusCode: 400, message: "Use valid invoice dates (YYYY-MM-DD)" });
+     if (from && to && from > to) throw createHttpError({ statusCode: 400, message: "Start date must not follow end date" });
+     const pagination = getPagination({ limit, page, offset });
+     const scopedIds = outletIds ? (outletIds.length ? await prisma.$queryRaw(Prisma.sql`SELECT b.id FROM "Bill" b LEFT JOIN "Order" o ON o.id=b."orderId" WHERE b."businessId"=${business.id} AND COALESCE(NULLIF(b.metadata->>'outlet_id',''), NULLIF(b.metadata->>'outletId',''), o."outletId") IN (${Prisma.join(outletIds)})`) : []) : null;
+-    const bills = await prisma.bill.findMany({
++    const bills = await readExportPage(prisma.bill, {
+       where: { businessId: business.id, ...(scopedIds ? { id: { in: scopedIds.map((row) => row.id) } } : {}), ...((from || to) ? { createdAt: { ...(from ? { gte: new Date(`${from}T00:00:00Z`) } : {}), ...(to ? { lt: new Date(Date.parse(`${to}T00:00:00Z`) + 86400000) } : {}) } } : {}) },
+       include: getBillInclude(),
+       orderBy: { createdAt: "desc" },
+       take: pagination.take,
+       skip: pagination.skip,
+-    });
++    }, query);
+ 
+     return bills.map(serializeBill);
+   }
+--- a/backend/src/core/inventory/inventory.service.js
++++ b/backend/src/core/inventory/inventory.service.js
+@@ -1,3 +1,4 @@
++import { readExportPage } from "../../shared/utils/export-cursor.js";
+ import prisma from "../../database/prisma/client.js";
+ import { moveStock } from "./stock-ledger.service.js";
+ import { createHttpError } from "../../shared/utils/http-error.js";
+@@ -17,13 +18,13 @@
+   async listItems({ tenantId, query = {} }) {
+     const business = await ensureBusiness({ tenantId });
+     const pagination = getPagination(query);
+-    const items = await prisma.inventoryItem.findMany({
++    const items = await readExportPage(prisma.inventoryItem, {
+       where: { businessId: business.id },
+       include: getInventoryInclude(),
+       orderBy: { createdAt: "asc" },
+       take: pagination.take,
+       skip: pagination.skip,
+-    });
++    }, query);
+ 
+     return items.map(serializeInventoryItem);
+   }
+--- a/backend/src/core/orders/orders.service.js
++++ b/backend/src/core/orders/orders.service.js
+@@ -1,3 +1,4 @@
++import { readExportPage } from "../../shared/utils/export-cursor.js";
+ import prisma from "../../database/prisma/client.js";
+ import {
+   ensureBusiness,
+@@ -60,13 +61,13 @@
+   async listOrders({ tenantId, query = {} }) {
+     const business = await ensureBusiness({ tenantId });
+     const pagination = getPagination(query);
+-    const orders = await prisma.order.findMany({
++    const orders = await readExportPage(prisma.order, {
+       where: { businessId: business.id },
+       include: getOrderInclude(),
+       orderBy: { createdAt: "desc" },
+       take: pagination.take,
+       skip: pagination.skip,
+-    });
++    }, query);
+ 
+     return orders.map(serializeOrder);
+   }
+--- a/backend/src/core/products/products.service.js
++++ b/backend/src/core/products/products.service.js
+@@ -1,3 +1,4 @@
++import { readExportPage } from "../../shared/utils/export-cursor.js";
+ import prisma from "../../database/prisma/client.js";
+ import { attachProductImages, saveProductImage } from "./product-images.js";
+ import { normalizeChannelSettings } from "./qr-menu-details.js";
+@@ -74,13 +75,13 @@
+     const channel = MENU_CHANNELS.includes(query.channel) ? query.channel : null;
+     const pagination = getPagination(query);
+     const [products, rules] = await Promise.all([
+-      prisma.product.findMany({
++      readExportPage(prisma.product, {
+         where: { businessId: business.id },
+         include: getProductInclude(outletId),
+         orderBy: { createdAt: "asc" },
+         take: pagination.take,
+         skip: pagination.skip,
+-      }),
++      }, query),
+       loadActiveRules(prisma, business.id),
+     ]);
+     const at = new Date();
+--- a/backend/src/core/sync/operational-exports.js
++++ b/backend/src/core/sync/operational-exports.js
+@@ -1,3 +1,4 @@
++import { readExportPage } from "../../shared/utils/export-cursor.js";
+ // Read-only projections for AdminCore. Domain writes remain in their existing services.
+ const definitions = {
+   "tip-payouts": { model: "tipPayout", fields: "outletId userName amount periodFrom periodTo method voidedAt", title: "userName", updated: false },
+@@ -28,10 +29,10 @@
+     throw new Error("Invalid export pagination");
+   }
+   if (resource === "table-assistance") {
+-    const docs = await client.stateDocument.findMany({
++    const docs = await readExportPage(client.stateDocument, {
+       where: { key: { startsWith: `assistance:${business.id}:` }, ...(query.outlet_id || query.outletId ? { data: { path: ["outlet_id"], equals: String(query.outlet_id || query.outletId) } } : {}) },
+       select: { key: true, data: true }, orderBy: { key: "asc" }, take: limit, skip: offset,
+-    });
++    }, query, { idField: "key" });
+     const sessionIds = [...new Set(docs.map(doc => doc.data.session_id).filter(Boolean))];
+     const sessions = sessionIds.length ? await client.tableSession.findMany({ where: { businessId: business.id, id: { in: sessionIds } }, select: { id: true, status: true, openedAt: true } }) : [];
+     const fields = "id business_id outlet_id table_id table_name kind note payment_method status created_at accepted_at resolved_at assignee_name".split(" ");
+@@ -54,7 +55,7 @@
+     else if (resource === "menu-pricing") where.OR = [{ outletIds: { isEmpty: true } }, { outletIds: { has: String(requestedOutlet) } }];
+     else throw new Error("This export is business-wide; remove the outlet filter");
+   }
+-  const rows = await client[config.model].findMany({ where, select, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: limit, skip: offset });
++  const rows = await readExportPage(client[config.model], { where, select, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: limit, skip: offset }, query);
+   return rows.map(source => {
+     const { code, _count, ...row } = source;
+     if (row.businessId !== business.id) throw new Error("Export returned a record outside the verified business");
+--- a/backend/src/core/sync/sync.service.js
++++ b/backend/src/core/sync/sync.service.js
+@@ -1,3 +1,5 @@
++import env from "../../config/env.js";
++import { EXPORT_CURSOR, beginExportCursor, finishExportCursor, readExportPage } from "../../shared/utils/export-cursor.js";
+ import { readFile } from "fs/promises";
+ import { createHash, randomUUID } from "node:crypto";
+ import path from "path";
+@@ -32,21 +34,25 @@
+ 
+ const nowIso = () => new Date().toISOString();
+ const collectExportRows = async (fetchPage) => {
+-  const rows = [];
+-  const seen = new Set();
++  const rows = [], seen = new Set();
++  const context = { state: { limit: 250, offset: 0, positions: {}, bounds: {} }, secret: "internal-collector", completeScope: false, reads: {} };
+   for (let offset = 0; offset < 50000; offset += 250) {
+-    const page = await fetchPage({ limit: 250, offset });
++    context.reads = {};
++    const cursorQuery = { [EXPORT_CURSOR]: context };
++    const page = await fetchPage({ limit: 250, offset, query: cursorQuery, ...cursorQuery });
++    if (!Object.keys(context.reads).length) throw createHttpError({ statusCode: 502, code: "POS_PAGINATION_INVALID", message: "Export loader did not establish a stable cursor" });
+     for (const row of page) {
+-      if (!row.id || seen.has(row.id)) {
+-        throw createHttpError({ statusCode: 502, code: "POS_PAGINATION_INVALID", message: "Export pagination repeated a record" });
+-      }
+-      seen.add(row.id);
+-      rows.push(row);
++      if (!row.id || seen.has(row.id)) throw createHttpError({ statusCode: 502, code: "POS_PAGINATION_INVALID", message: "Export pagination repeated a record" });
++      seen.add(row.id); rows.push(row);
+     }
+-    if (page.length < 250) return rows;
++    const pagination = finishExportCursor(context, { grouped: Object.keys(context.reads).length > 1 });
++    if (!pagination.has_more) return rows;
++    for (const [group, read] of Object.entries(context.reads)) if (read.last) context.state.positions[group] = read.last;
++    context.state.offset = pagination.next_offset;
+   }
+   throw createHttpError({ statusCode: 503, code: "POS_EXPORT_TOO_LARGE", message: "Export exceeds the synchronous limit; a background export is required" });
+ };
++
+ const ADMINCORE_SYNC_RESOURCES = [
+   ...OPERATIONAL_EXPORT_RESOURCES,
+   "businesses",
+@@ -317,29 +323,29 @@
+   return rows;
+ };
+ 
+-const listQrExportRows = async (business, limit = 250, offset = 0) => {
++const listQrExportRows = async (business, limit = 250, offset = 0, query = {}) => {
+   const [qrCodes, sessions, scans] = await Promise.all([
+-    prisma.tableQrCode.findMany({
++    readExportPage(prisma.tableQrCode, {
+       where: { businessId: business.id },
+       include: { table: { include: { area: true } } },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
+-    prisma.tableSession.findMany({
++    }, query, { group: "table_qr_code" }),
++    readExportPage(prisma.tableSession, {
+       where: { businessId: business.id },
+       include: { table: true, qrCode: true },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
+-    prisma.tableQrScanEvent.findMany({
++    }, query, { group: "table_session" }),
++    readExportPage(prisma.tableQrScanEvent, {
+       where: { businessId: business.id },
+       include: { qrCode: true },
+       orderBy: [{ scannedAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
++    }, query, { group: "qr_scan_event" }),
+   ]);
+ 
+   return [
+@@ -410,36 +416,36 @@
+   ];
+ };
+ 
+-const listCentralKitchenRows = async (business, limit = 250, offset = 0) => {
++const listCentralKitchenRows = async (business, limit = 250, offset = 0, query = {}) => {
+   const [purchaseOrders, allocations, routePlans, movements] = await Promise.all([
+-    prisma.purchaseOrder.findMany({
++    readExportPage(prisma.purchaseOrder, {
+       where: { businessId: business.id },
+       include: { outlet: true, requestedBy: { select: { id: true, name: true, email: true } } },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
+-    prisma.allocation.findMany({
++    }, query, { group: "purchase_order" }),
++    readExportPage(prisma.allocation, {
+       where: { businessId: business.id },
+       include: { outlet: true },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
+-    prisma.routePlan.findMany({
++    }, query, { group: "allocation" }),
++    readExportPage(prisma.routePlan, {
+       where: { businessId: business.id },
+       include: { stops: { include: { outlet: true }, orderBy: { sequence: "asc" } } },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
+-    prisma.inventoryMovement.findMany({
++    }, query, { group: "route_plan" }),
++    readExportPage(prisma.inventoryMovement, {
+       where: { businessId: business.id },
+       include: { inventoryItem: true },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: limit,
+       skip: offset,
+-    }),
++    }, query, { group: "inventory_movement" }),
+   ]);
+ 
+   return [
+@@ -530,8 +536,8 @@
+ 
+ const listSupplierRows = async (business, limit = 250) => {
+   const [items, purchaseOrders] = await Promise.all([
+-    collectExportRows(page => prisma.inventoryItem.findMany({ where: { businessId: business.id }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: page.limit, skip: page.offset })),
+-    collectExportRows(page => prisma.purchaseOrder.findMany({ where: { businessId: business.id }, include: { outlet: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: page.limit, skip: page.offset })),
++    collectExportRows(page => readExportPage(prisma.inventoryItem, { where: { businessId: business.id }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: page.limit, skip: page.offset }, page)),
++    collectExportRows(page => readExportPage(prisma.purchaseOrder, { where: { businessId: business.id }, include: { outlet: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: page.limit, skip: page.offset }, page)),
+   ]);
+   const suppliers = new Map();
+   for (const item of items) {
+@@ -596,7 +602,7 @@
+   const [roles, permissions, users] = await Promise.all([
+     prisma.role.findMany({ include: { permissions: { include: { permission: true } } }, orderBy: { name: "asc" } }),
+     prisma.permission.findMany({ orderBy: { key: "asc" } }),
+-    collectExportRows(page => prisma.user.findMany({
++    collectExportRows(page => readExportPage(prisma.user, {
+       where: { businessId: business.id },
+       include: {
+         role: true,
+@@ -605,7 +611,7 @@
+       },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: page.limit, skip: page.offset,
+-    })),
++    }, page)),
+   ]);
+   return [
+     ...roles.map((role) => ({
+@@ -663,18 +669,18 @@
+ 
+ const listAuditSecurityRows = async (business, limit = 250) => {
+   const [activities, tokens] = await Promise.all([
+-    collectExportRows(page => prisma.staffActivity.findMany({
++    collectExportRows(page => readExportPage(prisma.staffActivity, {
+       where: { user: { is: { businessId: business.id } } },
+       include: { user: { select: { id: true, name: true, email: true, role: { select: { name: true } } } } },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: page.limit, skip: page.offset,
+-    })),
+-    collectExportRows(page => prisma.authToken.findMany({
++    }, page)),
++    collectExportRows(page => readExportPage(prisma.authToken, {
+       where: { user: { is: { businessId: business.id } } },
+       include: { user: { select: { id: true, name: true, email: true } } },
+       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+       take: page.limit, skip: page.offset,
+-    })),
++    }, page)),
+   ]);
+   return [
+     ...activities.map((activity) => ({
+@@ -875,6 +881,11 @@
+     const pagination = getPagination(query);
+     if (paginated) query = { ...query, limit: pagination.limit, offset: pagination.offset };
+     const limit = getSyncLimit(query.limit);
++    const cursorContext = paginated ? beginExportCursor({ business: await getBusinessContext({ tenantId, businessId }),
++      resource: normalizedResource, query, limit: pagination.limit, offset: pagination.offset,
++      secret: env.admincore.apiKey || env.auth.jwtSecret }) : null;
++    if (cursorContext) query = { ...query, [EXPORT_CURSOR]: cursorContext };
++
+     let data;
+ 
+     if (OPERATIONAL_EXPORT_RESOURCES.includes(normalizedResource)) {
+@@ -893,6 +904,7 @@
+         limit,
+         page: query.page,
+         offset: query.offset,
++        query,
+       });
+     } else if (normalizedResource === "customers") {
+       const [bills, orders] = await Promise.all([
+@@ -934,7 +946,7 @@
+     } else if (normalizedResource === "tables") {
+       data = await tableManagementService.listTables({ tenantId, businessId });
+     } else if (normalizedResource === "qr") {
+-      data = await listQrExportRows(await getBusinessContext({ tenantId, businessId }), limit, pagination.offset);
++      data = await listQrExportRows(await getBusinessContext({ tenantId, businessId }), limit, pagination.offset, query);
+     } else if (normalizedResource === "reservations") {
+       data = await tableManagementService.listReservations({ tenantId, businessId, includeHistory: true });
+     } else if (normalizedResource === "kot") {
+@@ -943,11 +955,12 @@
+         limit,
+         offset: pagination.offset,
+         ascending: true,
++        query,
+         status: query.status,
+         stationId: query.station_id || query.stationId,
+       });
+     } else if (normalizedResource === "central-kitchen") {
+-      data = await listCentralKitchenRows(await getBusinessContext({ tenantId, businessId }), limit, pagination.offset);
++      data = await listCentralKitchenRows(await getBusinessContext({ tenantId, businessId }), limit, pagination.offset, query);
+     } else if (normalizedResource === "taxes") {
+       const business = await getBusinessContext({ tenantId, businessId });
+       const bills = await collectExportRows(page => billingService.listInvoices({ tenantId: business.tenantId, ...page }));
+@@ -963,7 +976,7 @@
+       data = await listSupplierRows(await getBusinessContext({ tenantId, businessId }), limit);
+     } else if (normalizedResource === "expenses") {
+       const business = await getBusinessContext({ tenantId, businessId });
+-      const centralKitchenRows = await collectExportRows(page => listCentralKitchenRows(business, page.limit, page.offset));
++      const centralKitchenRows = await collectExportRows(page => listCentralKitchenRows(business, page.limit, page.offset, page));
+       data = centralKitchenRows
+         .filter((row) => ["purchase_order", "allocation"].includes(row.resource_type))
+         .map((row) => ({
+@@ -1058,11 +1071,7 @@
+         lastSyncedAt: syncedAt,
+       });
+     if (paginated) {
+-      envelope.meta.pagination = {
+-        limit: pagination.limit, offset: pagination.offset,
+-        has_more: grouped ? Object.values(items.reduce((counts, row) => { counts[row.resource_type] = (counts[row.resource_type] || 0) + 1; return counts; }, {})).some(count => count >= pagination.limit) : items.length === pagination.limit,
+-        next_offset: pagination.offset + (grouped ? pagination.limit : items.length),
+-      };
++      envelope.meta.pagination = finishExportCursor(cursorContext, { grouped });
+     }
+     return {
+       ...envelope,
+--- a/backend/src/features/kitchen/kot/kot.service.js
++++ b/backend/src/features/kitchen/kot/kot.service.js
+@@ -1,3 +1,4 @@
++import { readExportPage } from "../../../shared/utils/export-cursor.js";
+ import prisma from "../../../database/prisma/client.js";
+ import { admincoreChangeSyncService } from "../../../core/admincore/admincore-change-sync.service.js";
+ import { aggregateKitchenStatus, validateKitchenTransition } from "./kot-workflow.js";
+@@ -182,10 +183,10 @@
+     return ticket;
+   }
+ 
+-  async listTickets({ tenantId, limit, offset = 0, ascending = false, status, stationId, active = false, outletIds }) {
++  async listTickets({ tenantId, limit, offset = 0, ascending = false, status, stationId, active = false, outletIds, query = {} }) {
+     const business = await ensureBusiness({ tenantId });
+     const parsedLimit = Number(limit);
+-    const tickets = await prisma.kitchenTicket.findMany({
++    const tickets = await readExportPage(prisma.kitchenTicket, {
+       where: {
+         businessId: business.id,
+         ...(status ? { status } : {}),
+@@ -199,7 +200,7 @@
+         orderBy: [{ createdAt: ascending ? "asc" : "desc" }, { id: "asc" }],
+         skip: offset,
+       ...(Number.isInteger(parsedLimit) && parsedLimit > 0 ? { take: parsedLimit } : {}),
+-    });
++    }, query);
+ 
+     const items = tickets
+       .map((ticket) => this.serializeTicket(ticket))
+--- /dev/null
++++ b/backend/src/shared/utils/export-cursor.js
+@@ -0,0 +1,74 @@
++import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
++import { createHttpError } from './http-error.js';
++
++// Only bridge exports receive this symbol. Native screen queries retain their paging.
++export const EXPORT_CURSOR = Symbol('admincore-export-cursor');
++const TTL_MS = 15 * 60 * 1000;
++const transportKeys = new Set(['cursor', 'offset', 'page', 'limit']);
++const scopeKeys = new Set(['business_id', 'businessId', 'tenant_id', 'tenantId']);
++const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
++  ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
++const fail = message => createHttpError({ statusCode: 409, code: 'EXPORT_CURSOR_INVALID', message });
++const signature = (encoded, secret) => createHmac('sha256', secret).update(encoded).digest('base64url');
++
++export function beginExportCursor({ business, resource, query, limit, offset, secret, now = Date.now() }) {
++  const filters = Object.fromEntries(Object.entries(query).filter(([key]) => !transportKeys.has(key)));
++  const identity = { business: business.id, tenant: business.tenantId, resource, limit,
++    filters: createHash('sha256').update(JSON.stringify(canonical(filters))).digest('hex') };
++  let state = { ...identity, issued: now, offset: 0, positions: {}, bounds: {} };
++  if (query.cursor) {
++    if (typeof query.cursor !== 'string' || query.cursor.length > 8192) throw fail('Invalid export continuation');
++    const parts = query.cursor.split('.');
++    if (parts.length !== 2) throw fail('Invalid export continuation');
++    const expected = signature(parts[0], secret);
++    const suppliedSignature = Buffer.from(parts[1]);
++    const expectedSignature = Buffer.from(expected);
++    if (suppliedSignature.length !== expectedSignature.length || !timingSafeEqual(suppliedSignature, expectedSignature)) throw fail('Invalid export continuation');
++    try { state = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); }
++    catch { throw fail('Invalid export continuation'); }
++    if (Object.entries(identity).some(([key, value]) => state[key] !== value) || state.offset !== offset) throw fail('Export scope or page changed; restart from the first page');
++    if (!Number.isSafeInteger(state.issued) || state.issued > now + 60000 || now - state.issued > TTL_MS) throw fail('Export continuation expired; restart from the first page');
++    for (const map of [state.positions, state.bounds]) {
++      if (!map || typeof map !== 'object' || Array.isArray(map) || Object.values(map).some(value => value !== null && (typeof value !== 'string' || value.length > 500))) throw fail('Invalid export continuation');
++    }
++  } else if (offset !== 0) {
++    throw fail('Export continuation is required after the first page');
++  }
++  const completeScope = Object.entries(filters).every(([key, value]) => scopeKeys.has(key) || value === undefined || value === null || value === '');
++  return { state, secret, completeScope, reads: {} };
++}
++
++export async function readExportPage(delegate, args, query = {}, { group = 'default', idField = 'id' } = {}) {
++  const context = query[EXPORT_CURSOR];
++  if (!context) return delegate.findMany(args);
++  const { state } = context;
++  if (!Object.hasOwn(state.bounds, group)) {
++    const last = await delegate.findFirst({ where: args.where, select: { [idField]: true }, orderBy: { [idField]: 'desc' } });
++    state.bounds[group] = last?.[idField] ?? null;
++  }
++  const bound = state.bounds[group];
++  if (bound === null) {
++    context.reads[group] = { count: 0, last: null };
++    return [];
++  }
++  const position = state.positions[group];
++  const rows = await delegate.findMany({ ...args, where: { AND: [args.where || {}, { [idField]: { lte: bound, ...(position ? { gt: position } : {}) } }] },
++    orderBy: { [idField]: 'asc' }, skip: 0, take: state.limit });
++  context.reads[group] = { count: rows.length, last: rows.at(-1)?.[idField] ?? null };
++  return rows;
++}
++
++export function finishExportCursor(context, { grouped = false } = {}) {
++  const positions = { ...context.state.positions };
++  for (const [group, read] of Object.entries(context.reads)) {
++    if (read.last) positions[group] = read.last;
++  }
++  const hasMore = Object.entries(context.reads).some(([group, read]) => read.count === context.state.limit && read.last !== context.state.bounds[group]);
++  const consumed = Math.max(0, ...Object.values(context.reads).map(read => read.count));
++  const nextOffset = context.state.offset + (grouped ? context.state.limit : consumed);
++  const state = { ...context.state, offset: nextOffset, positions };
++  const encoded = Buffer.from(JSON.stringify(state)).toString('base64url');
++  return { strategy: 'bounded-id-v1', limit: state.limit, offset: context.state.offset, next_offset: nextOffset,
++    has_more: hasMore, complete_scope: context.completeScope,
++    next_cursor: hasMore ? `${encoded}.${signature(encoded, context.secret)}` : null };
++}

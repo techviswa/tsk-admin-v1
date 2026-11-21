@@ -4,6 +4,7 @@ frontend/node_modules/
 
 # Environment / secrets
 .env
+.env.*.local
 *.env
 backend/.env
 frontend/.env
@@ -31,6 +32,12 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # Local databases and runtime data
+recovery-backups/
+.pos-*/
+pos-credential-fix/
+*.dump
+*.sql.gz
+*.bson
 backend/mongo-data/
 dump.rdb
 memory/test_credentials.md
@@ -38,7 +45,8 @@ test_reports/
 
 # IDE/system
 .idea/
-.vscode/
+.vscode/*
+!.vscode/launch.json
 .DS_Store
 
 # Archives / large binaries

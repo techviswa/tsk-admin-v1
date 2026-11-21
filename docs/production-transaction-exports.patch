@@ -1,0 +1,24 @@
+--- a/backend/src/core/sync/operational-exports.js
++++ b/backend/src/core/sync/operational-exports.js
+@@ -1,5 +1,10 @@
+ // Read-only projections for AdminCore. Domain writes remain in their existing services.
+ const definitions = {
++  "tip-payouts": { model: "tipPayout", fields: "outletId userName amount periodFrom periodTo method voidedAt", title: "userName", updated: false },
++  payslips: { model: "payslip", fields: "runId userName role daysInPeriod daysPresent lopDays hoursWorked overtimeHours gross totalDeductions netPay tipsPaid paidAt paymentMethod", title: "userName" },
++  "loyalty-ledger": { model: "loyaltyEntry", fields: "customerId billId type points value balanceAfter expiresAt", title: "type", updated: false },
++  "gift-card-transactions": { model: "giftCardTransaction", fields: "giftCardId outletId type amount balanceAfter billId paymentMethod settlementShiftId", title: "type", updated: false },
++  "marketing-delivery": { model: "marketingMessage", fields: "campaignId customerId channel status attempts nextAttemptAt sentAt deliveredAt readAt", title: "channel" },
+   attendance: { model: "attendanceEntry", fields: "outletId userName userRole clockInAt clockOutAt breaks source note", where: { deletedAt: null }, title: "userName" },
+   tips: { model: "tip", fields: "outletId recipientName amount pooled source method note voidedAt", title: "recipientName" },
+   payroll: { model: "payrollRun", fields: "label periodFrom periodTo status finalizedAt note", title: "label" },
+@@ -55,7 +60,9 @@
+     if (row.businessId !== business.id) throw new Error("Export returned a record outside the verified business");
+     let status = row.status || "active";
+     if (resource === "attendance") status = row.clockOutAt ? "completed" : "clocked_in";
+-    if (resource === "tips" && row.voidedAt) status = "void";
++    if (["tips", "tip-payouts"].includes(resource) && row.voidedAt) status = "void";
++    if (resource === "payslips") status = row.paidAt ? "paid" : "unpaid";
++    if (["loyalty-ledger", "gift-card-transactions"].includes(resource)) status = row.type || "recorded";
+     if (resource === "loyalty-customers" && row.anonymizedAt) {
+       status = "anonymized";
+       row.name = "Anonymized customer"; row.phone = null; row.email = null; row.tags = [];

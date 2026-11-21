@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-31",
+  "result": "passed",
+  "scope": "Provided-only compact POS billing services",
+  "frontend_tests": 99,
+  "production_frontend_build": "passed",
+  "behaviour": [
+    "Unprovided services absent from selector",
+    "No selector or duplicate service-name card for a sole service",
+    "Empty orders automatically select the provided service",
+    "Multiple provided services use compact wrapping buttons",
+    "Existing carts require explicit setup review if their service is withdrawn",
+    "No configured service exposes no order controls"
+  ],
+  "pos_source_sha256": {
+    "frontend/src/App.css": "7272c40f76ee4fc34ffa76bc30f8b30c6281a2dbd02c0cb5a043cc75489f6f4c",
+    "frontend/src/pages/Billing.js": "a84c2d28667f18310efccb8904b0a4d0f3e4a449ebe267004624f241fbe68d4c",
+    "frontend/src/pages/Billing.scope.test.js": "e5a7cc1f5af7b062018d3fd080b1f3c092fa0066dd0999e28a41a74928b5662d",
+    "frontend/src/features/billing/fulfillment/components/FulfillmentDetailsFields.jsx": "11cb353391bf1ed4ef94981010f6248a8d77ea9ab3a908b1942ab79a3b1e6abf",
+    "frontend/src/features/billing/fulfillment/components/FulfillmentModeSelector.jsx": "f325f32b2abcf3494a842057bd6d553c4f60a59721f8d93ddf4b0f14de5f0141",
+    "frontend/src/features/billing/fulfillment/components/FulfillmentModeSelector.test.js": "a9927c609a595d9f0572f2087bfeb064d87798fc49bb7e4a0c984ddd2005d76f",
+    "frontend/src/features/billing/fulfillment/pages/BillingFulfillmentSection.jsx": "4c05c1189a4bf275232b597f043be265e8082979ebaeee2197e90f6f2f4494d2",
+    "frontend/src/features/billing/fulfillment/pages/BillingFulfillmentSection.test.js": "9ec0afdd9592aef030dc084f798cf984a12737cf864a63ffce01c50ef5fec5ec"
+  },
+  "notes": [
+    "Existing billing workflows and backend policy enforcement retained",
+    "No business data changes, backend changes or deployment"
+  ]
+}

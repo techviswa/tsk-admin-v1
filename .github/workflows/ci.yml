@@ -54,6 +54,15 @@ jobs:
       - name: Run production guards
         run: python -m unittest discover -s backend -p "test_production_*.py"
 
+      - name: Run business assignment recovery tests
+        run: python -m unittest discover -s backend -p "test_business_assignments.py"
+
+      - name: Run report export tests
+        run: python -m unittest discover -s backend -p "test_report_exports.py"
+
+      - name: Run outlet sync tests
+        run: python -m unittest discover -s backend -p "test_outlet_sync.py"
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -81,4 +90,71 @@ jobs:
 
       - name: Verify safe backend recovery
         working-directory: frontend
-        run: npm test -- --watchAll=false --runInBand api.recovery.test.js
+        run: npm test -- --watchAll=false --runInBand
+
+  coupled:
+    name: Both APIs and durable workers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: coupled_runner
+          POSTGRES_PASSWORD: coupled-ci-disposable-only
+          POSTGRES_DB: coupled_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U coupled_runner -d coupled_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: admin
+      - name: Checkout paired POS revision
+        uses: actions/checkout@v4
+        with:
+          repository: techviswa/pos_v1
+          ref: ${{ vars.POS_INTEGRATION_REF }}
+          token: ${{ secrets.POS_REPO_TOKEN || github.token }}
+          path: pos
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install both backends
+        run: |
+          pip install -r admin/backend/requirements-test.txt
+          npm ci --prefix pos/backend
+          npm exec --prefix pos/backend -- prisma generate --schema pos/backend/prisma/schema.prisma
+      - name: Test complete AdminCore backend, including real database aggregates
+        working-directory: admin
+        env:
+          MONGO_URL: mongodb://127.0.0.1:27017
+          DB_NAME: admincore_ci
+          RUN_PROJECTION_DB_TESTS: "1"
+        run: python -m unittest discover -s backend -p 'test_*.py'
+      - name: Select matching PostgreSQL backup and restore clients
+        run: bash admin/scripts/ci-postgres-tools.sh
+      - name: Prove paired API delivery and restart recovery
+        working-directory: admin
+        run: >-
+          python tests/coupled_api_check.py --pos-root ../pos --pos-suite
+          --database-url 'postgresql://coupled_runner:coupled-ci-disposable-only@127.0.0.1:5432/coupled_ci?schema=public'
+      - name: Retain isolated acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coupled-api-evidence
+          path: |
+            admin/recovery-backups/coupled-*/result.json
+            admin/recovery-backups/coupled-*/restore-proof/result.json
+          if-no-files-found: warn

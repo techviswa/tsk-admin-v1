@@ -1,0 +1,187 @@
+--- a/backend/src/core/sync/sync.service.js
++++ b/backend/src/core/sync/sync.service.js
+@@ -23,6 +23,7 @@
+ } from "./admincore-sync-log.repository.js";
+ import { createSyncEnvelope } from "./sync-contract.js";
+ import { getPagination } from "../../shared/utils/pagination.js";
++import { OPERATIONAL_EXPORT_RESOURCES, exportOperationalRows } from "./operational-exports.js";
+ 
+ const __filename = fileURLToPath(import.meta.url);
+ const __dirname = path.dirname(__filename);
+@@ -47,6 +48,7 @@
+   throw createHttpError({ statusCode: 503, code: "POS_EXPORT_TOO_LARGE", message: "Export exceeds the synchronous limit; a background export is required" });
+ };
+ const ADMINCORE_SYNC_RESOURCES = [
++  ...OPERATIONAL_EXPORT_RESOURCES,
+   "businesses",
+   "outlets",
+   "products",
+@@ -861,13 +863,15 @@
+ 
+   async exportResource({ resource, tenantId, businessId, query = {} }) {
+     const normalizedResource = normalizeResource(resource);
+-    const paginated = ["products", "orders", "bills", "inventory"].includes(normalizedResource);
++    const paginated = [...OPERATIONAL_EXPORT_RESOURCES, "products", "orders", "bills", "inventory"].includes(normalizedResource);
+     const pagination = getPagination(query);
+     if (paginated) query = { ...query, limit: pagination.limit, offset: pagination.offset };
+     const limit = getSyncLimit(query.limit);
+     let data;
+ 
+-    if (normalizedResource === "businesses") {
++    if (OPERATIONAL_EXPORT_RESOURCES.includes(normalizedResource)) {
++      data = await exportOperationalRows({ resource: normalizedResource, business: await getBusinessContext({ tenantId, businessId }), query, client: prisma });
++    } else if (normalizedResource === "businesses") {
+       data = await businessesService.listBusinesses({ businessId });
+     } else if (normalizedResource === "outlets") {
+       data = await outletsService.listOutlets({ tenantId, businessId });
+--- a/backend/scripts/deploy-check.mjs
++++ b/backend/scripts/deploy-check.mjs
+@@ -48,6 +48,7 @@
+   "node scripts/access-control-tests.mjs",
+   "node scripts/production-flow-tests.mjs",
+   "node scripts/admincore-reliability-tests.mjs",
++  "node --test scripts/operational-export-tests.mjs",
+   "node scripts/sync-reconciliation-tests.mjs",
+   "node scripts/payment-isolation-tests.mjs",
+   "node scripts/submitted-payment-tests.mjs",
+--- /dev/null
++++ b/backend/src/core/sync/operational-exports.js
+@@ -0,0 +1,73 @@
++// Read-only projections for AdminCore. Domain writes remain in their existing services.
++const definitions = {
++  attendance: { model: "attendanceEntry", fields: "outletId userName userRole clockInAt clockOutAt breaks source note", where: { deletedAt: null }, title: "userName" },
++  tips: { model: "tip", fields: "outletId recipientName amount pooled source method note voidedAt", title: "recipientName" },
++  payroll: { model: "payrollRun", fields: "label periodFrom periodTo status finalizedAt note", title: "label" },
++  "loyalty-customers": { model: "customer", fields: "name phone email tags marketingOptIn loyaltyPoints visitCount totalSpent firstVisitAt lastVisitAt anonymizedAt", title: "name" },
++  "gift-cards": { model: "giftCard", fields: "outletId code recipientName initialValue balance status expiresAt", title: "recipientName" },
++  marketing: { model: "marketingCampaign", fields: "name channel kind status scheduledAt startedAt completedAt sendHour", title: "name" },
++  "menu-pricing": { model: "priceRule", fields: "name active discountType value daysOfWeek startMinute endMinute timezone channels outletIds productIds categories validFrom validTo", title: "name" },
++  "guest-feedback": { model: "feedback", fields: "customerName rating comment billId", title: "customerName", updated: false },
++  "table-assistance": { model: "stateDocument", fields: "", title: "table_name" },
++};
++
++export const OPERATIONAL_EXPORT_RESOURCES = Object.freeze(Object.keys(definitions));
++
++export const exportOperationalRows = async ({ resource, business, query = {}, client }) => {
++  const config = definitions[resource];
++  if (!config) throw new Error("Unsupported operational export");
++  if (!business?.id || !business?.tenantId) throw new Error("A verified business and tenant are required");
++  const limit = Number(query.limit ?? 100);
++  const offset = Number(query.offset ?? 0);
++  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 250 || !Number.isSafeInteger(offset) || offset < 0) {
++    throw new Error("Invalid export pagination");
++  }
++  if (resource === "table-assistance") {
++    const docs = await client.stateDocument.findMany({
++      where: { key: { startsWith: `assistance:${business.id}:` }, ...(query.outlet_id || query.outletId ? { data: { path: ["outlet_id"], equals: String(query.outlet_id || query.outletId) } } : {}) },
++      select: { key: true, data: true }, orderBy: { key: "asc" }, take: limit, skip: offset,
++    });
++    const sessionIds = [...new Set(docs.map(doc => doc.data.session_id).filter(Boolean))];
++    const sessions = sessionIds.length ? await client.tableSession.findMany({ where: { businessId: business.id, id: { in: sessionIds } }, select: { id: true, status: true, openedAt: true } }) : [];
++    const fields = "id business_id outlet_id table_id table_name kind note payment_method status created_at accepted_at resolved_at assignee_name".split(" ");
++    return docs.map(({ data }) => {
++      if (data.business_id !== business.id) throw new Error("Export returned a record outside the verified business");
++      const row = Object.fromEntries(fields.map(key => [key, data[key] ?? null]));
++      const session = sessions.find(item => item.id === data.session_id);
++      if (["pending", "accepted"].includes(row.status) && (!session || session.status !== "active" || Date.parse(row.created_at) < new Date(session.openedAt).getTime())) row.status = "expired";
++      return { ...row, tenant_id: business.tenantId, tenantId: business.tenantId, title: `${row.table_name || "Table"}: ${row.kind || "Assistance"}` };
++    });
++  }
++  const fields = ["id", "businessId", "createdAt", ...(config.updated === false ? [] : ["updatedAt"]), ...config.fields.split(" ")];
++  const select = Object.fromEntries(fields.map(field => [field, true]));
++  if (resource === "payroll") select._count = { select: { payslips: true } };
++  const requestedOutlet = query.outlet_id || query.outletId;
++  const where = { businessId: business.id, ...config.where };
++  // Do not silently present business-wide data as an outlet-specific export.
++  if (requestedOutlet) {
++    if (config.fields.split(" ").includes("outletId")) where.outletId = String(requestedOutlet);
++    else if (resource === "menu-pricing") where.OR = [{ outletIds: { isEmpty: true } }, { outletIds: { has: String(requestedOutlet) } }];
++    else throw new Error("This export is business-wide; remove the outlet filter");
++  }
++  const rows = await client[config.model].findMany({ where, select, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: limit, skip: offset });
++  return rows.map(source => {
++    const { code, _count, ...row } = source;
++    if (row.businessId !== business.id) throw new Error("Export returned a record outside the verified business");
++    let status = row.status || "active";
++    if (resource === "attendance") status = row.clockOutAt ? "completed" : "clocked_in";
++    if (resource === "tips" && row.voidedAt) status = "void";
++    if (resource === "loyalty-customers" && row.anonymizedAt) {
++      status = "anonymized";
++      row.name = "Anonymized customer"; row.phone = null; row.email = null; row.tags = [];
++    }
++    if (resource === "menu-pricing") status = row.active ? "active" : "inactive";
++    if (resource === "guest-feedback") status = "received";
++    return {
++      ...row, business_id: business.id, tenant_id: business.tenantId, tenantId: business.tenantId,
++      outlet_id: row.outletId || null, status, title: row[config.title] || resource,
++      created_at: row.createdAt, updated_at: row.updatedAt,
++      ...(code ? { masked_code: `•••• ${code.slice(-4)}` } : {}),
++      ...(_count ? { payslip_count: _count.payslips } : {}),
++    };
++  });
++};
+--- /dev/null
++++ b/backend/scripts/operational-export-tests.mjs
+@@ -0,0 +1,62 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { exportOperationalRows, OPERATIONAL_EXPORT_RESOURCES } from '../src/core/sync/operational-exports.js';
++
++const business = { id: 'business-a', tenantId: 'tenant-a' };
++const fixture = (row) => {
++  const calls = [];
++  const client = new Proxy({}, { get: (_, model) => ({ findMany: async query => { calls.push({ model, query }); return [row]; } }) });
++  return { calls, client };
++};
++
++test('every operational export scopes and pages its query and adds verified identities', async () => {
++  for (const resource of OPERATIONAL_EXPORT_RESOURCES.filter(key => key !== 'table-assistance')) {
++    const { client, calls } = fixture({ id: 'r', businessId: business.id, name: 'Test', amount: 0 });
++    const rows = await exportOperationalRows({ resource, business, query: { limit: 50, offset: 100 }, client });
++    assert.equal(calls[0].query.where.businessId, business.id);
++    assert.equal(calls[0].query.take, 50); assert.equal(calls[0].query.skip, 100);
++    assert.deepEqual(calls[0].query.orderBy, [{ createdAt: 'asc' }, { id: 'asc' }]);
++    assert.equal(rows[0].business_id, business.id); assert.equal(rows[0].tenant_id, business.tenantId);
++  }
++});
++
++test('assistance exports scope stored documents and expire requests from ended sessions', async () => {
++  let query;
++  const client = { stateDocument: { findMany: async value => { query = value; return [{ data: { id: 'request', business_id: business.id, table_name: 'T1', kind: 'water', session_id: 'session', status: 'pending', created_at: '2026-01-01T12:00:00Z', secret: 'hidden' } }]; } },
++    tableSession: { findMany: async () => [] } };
++  const [row] = await exportOperationalRows({ resource: 'table-assistance', business, client });
++  assert.equal(query.where.key.startsWith, `assistance:${business.id}:`);
++  assert.equal(row.status, 'expired'); assert.equal(row.secret, undefined); assert.equal(row.session_id, undefined);
++  assert.equal(row.tenant_id, business.tenantId);
++});
++
++test('export refuses missing scope and foreign records', async () => {
++  const { client } = fixture({ id: 'foreign', businessId: 'other-business' });
++  await assert.rejects(exportOperationalRows({ resource: 'tips', business, client }), /outside/);
++  await assert.rejects(exportOperationalRows({ resource: 'tips', business: {}, client }), /verified/);
++});
++
++test('gift-card redemption code and anonymized customer PII are not exported', async () => {
++  let { client } = fixture({ id: 'card', businessId: business.id, code: 'PRIVATE-REDEEM-1234', balance: 0 });
++  const [card] = await exportOperationalRows({ resource: 'gift-cards', business, client });
++  assert.equal(card.code, undefined); assert.equal(card.masked_code, '•••• 1234'); assert.equal(card.balance, 0);
++  ({ client } = fixture({ id: 'customer', businessId: business.id, name: 'Erased name', phone: '123', email: 'private@example.com', anonymizedAt: new Date() }));
++  const [customer] = await exportOperationalRows({ resource: 'loyalty-customers', business, client });
++  assert.equal(customer.phone, null); assert.equal(customer.email, null); assert.equal(customer.name, 'Anonymized customer');
++});
++
++test('outlet filters are applied or explicitly rejected, not silently widened', async () => {
++  const { client, calls } = fixture({ id: 'tip', businessId: business.id });
++  await exportOperationalRows({ resource: 'tips', business, client, query: { outlet_id: 'outlet-a' } });
++  assert.equal(calls[0].query.where.outletId, 'outlet-a');
++  await assert.rejects(exportOperationalRows({ resource: 'payroll', business, client, query: { outlet_id: 'outlet-a' } }), /business-wide/);
++});
++
++test('deleted attendance is excluded and payroll excludes private pay profiles', async () => {
++  const { client, calls } = fixture({ id: 'row', businessId: business.id, clockOutAt: new Date() });
++  const [entry] = await exportOperationalRows({ resource: 'attendance', business, client });
++  assert.equal(calls[0].query.where.deletedAt, null); assert.equal(entry.status, 'completed');
++  await exportOperationalRows({ resource: 'payroll', business, client });
++  assert.deepEqual(calls[1].query.select._count, { select: { payslips: true } });
++  assert.equal(calls[1].query.select.profile, undefined);
++});

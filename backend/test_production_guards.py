@@ -9,18 +9,54 @@ with patch.dict(os.environ, {"MONGO_URL": "mongodb://127.0.0.1:27017", "DB_NAME"
 
 
 class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_production_configuration_cannot_start_workers(self):
+        with patch.object(server, "PRODUCTION_CONFIG_STATUS", {"ok": False, "errors": ["Missing secret"]}), \
+             patch.object(server, "seed_data", AsyncMock()) as seed:
+            with self.assertRaisesRegex(RuntimeError, "Invalid production configuration"):
+                await server.startup()
+        seed.assert_not_awaited()
+
+    async def test_readiness_requires_a_reachable_database(self):
+        database = SimpleNamespace(command=AsyncMock(side_effect=server.PyMongoError("offline")))
+        with patch.object(server, "db", database), patch.object(server, "PRODUCTION_CONFIG_STATUS", {"ok": True}):
+            with self.assertRaises(server.HTTPException) as raised:
+                await server.readiness_check()
+        self.assertEqual(raised.exception.status_code, 503)
+
+    async def test_background_imports_yield_to_pending_credentials(self):
+        jobs = SimpleNamespace(find_one=AsyncMock(return_value={"_id": "user"}))
+        with patch.object(server, "db", SimpleNamespace(pos_profile_jobs=jobs)), \
+             patch.object(server, "pos_rate_limit_seconds_remaining", return_value=0):
+            self.assertFalse(await server.pos_import_worker_ready())
+            self.assertTrue(await server.pos_profile_worker_ready())
+
+    async def test_background_imports_resume_when_credentials_are_finished(self):
+        jobs = SimpleNamespace(find_one=AsyncMock(return_value=None))
+        with patch.object(server, "db", SimpleNamespace(pos_profile_jobs=jobs)), \
+             patch.object(server, "pos_rate_limit_seconds_remaining", return_value=0):
+            self.assertTrue(await server.pos_import_worker_ready())
+
+    async def test_cooldown_pauses_both_workers_before_claiming_jobs(self):
+        jobs = SimpleNamespace(find_one=AsyncMock())
+        with patch.object(server, "db", SimpleNamespace(pos_profile_jobs=jobs)), \
+             patch.object(server, "pos_rate_limit_seconds_remaining", return_value=300):
+            self.assertFalse(await server.pos_import_worker_ready())
+            self.assertFalse(await server.pos_profile_worker_ready())
+        jobs.find_one.assert_not_awaited()
+
     async def test_sync_all_queues_every_resource_without_calling_pos(self):
         async def enqueue(resource, business_id):
             return {"id": f"pos-snapshot:{business_id}:{resource}", "status": "pending"}
         with patch.object(server, "get_current_user", new_callable=AsyncMock, return_value={"role": "platform_admin"}), \
              patch.object(server, "validate_pos_admin_business", new_callable=AsyncMock), \
              patch.object(server, "require_pos_bridge_access", new_callable=AsyncMock), \
+               patch.object(server, "pos_read_filter", new_callable=AsyncMock, return_value={}), \
              patch.object(server, "pos_headers_for_admin_business", new_callable=AsyncMock), \
              patch.object(server.pos_sync_worker, "enqueue_snapshot", new_callable=AsyncMock, side_effect=enqueue) as queue, \
              patch.object(server, "sync_pos_bridge_resource_for_system", new_callable=AsyncMock) as sync:
             with self.assertRaises(server.HTTPException):
-                await server.sync_all_pos_bridge_resources(None, None)
-            result = await server.sync_all_pos_bridge_resources(None, "a")
+                await server.sync_all_pos_bridge_resources(SimpleNamespace(headers={}), None)
+            result = await server.sync_all_pos_bridge_resources(SimpleNamespace(headers={}), "a")
         self.assertEqual(result["status"], "queued")
         self.assertEqual(set(result["results"]), set(server.POS_BRIDGE_RESOURCES))
         self.assertEqual(queue.await_count, len(server.POS_BRIDGE_RESOURCES))
@@ -86,11 +122,15 @@ class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
         push.assert_not_awaited()
 
     async def test_business_import_does_not_trigger_outbound_sync(self):
-        database = SimpleNamespace(businesses=SimpleNamespace(find_one=AsyncMock(return_value={"id": "a", "slug": "a"}), update_one=AsyncMock()))
+        database = SimpleNamespace(businesses=SimpleNamespace(find_one=AsyncMock(return_value={"id": "a", "slug": "a", "plan": "business", "status": "suspended"}), update_one=AsyncMock()))
         with patch.object(server, "db", database), \
              patch.object(server, "ensure_default_outlet_for_business", new_callable=AsyncMock) as outlet:
             await server.sync_bridge_business({"id": "pos-a", "tenant_id": "tenant-a"}, {"id": "admin"}, "now")
-        self.assertFalse(outlet.call_args.kwargs["sync_to_pos"])
+        outlet.assert_not_awaited()
+        update = database.businesses.update_one.await_args.args[1]["$set"]
+        self.assertEqual(update["pos_tenant_id"], "tenant-a")
+        self.assertEqual(update["plan"], "business")
+        self.assertEqual(update["status"], "suspended")
 
     def test_staff_export_alias_uses_registered_endpoint(self):
         self.assertEqual(server.pos_bridge_resource("staff"), server.pos_bridge_resource("staff-shifts"))
@@ -127,13 +167,15 @@ class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delete_notifications_reconcile_all_supported_mirror_resources(self):
         for resource in set(server.POS_BRIDGE_RESOURCES) - {"businesses", "staff-shifts"}:
-            collection = SimpleNamespace(delete_many=AsyncMock())
+            collection = SimpleNamespace(update_many=AsyncMock(), delete_many=AsyncMock())
             with patch.object(server, "db", {server.pos_bridge_resource(resource)["collection"]: collection}), \
                  patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={}), \
                  patch.object(server, "expected_pos_scope_for_business", new_callable=AsyncMock, return_value={"business_id": "pos-a", "tenant_id": "tenant-a"}), \
                  patch.object(server, "sync_pos_bridge_resource_for_system", new_callable=AsyncMock, return_value={"status": "success", "synced": []}):
                 await server.process_pos_change(resource, "a", {"action": "deleted", "record_id": "deleted-id"})
-            collection.delete_many.assert_awaited_once_with({"business_id": "a", "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a", "pos_external_id": "deleted-id"})
+            self.assertEqual(collection.update_many.call_args.args[0], {"business_id": "a", "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a", "pos_external_id": "deleted-id"})
+            self.assertFalse(collection.update_many.call_args.args[1]["$set"]["source_present"])
+            collection.delete_many.assert_not_awaited()
 
     async def test_unlinked_user_email_edit_updates_scoped_existing_pos_account(self):
         scope = {"business_id": "pos-a", "tenant_id": "tenant-a"}
@@ -169,9 +211,10 @@ class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(call.args[1] == "business-a" for call in sync.await_args_list))
 
     async def test_delete_is_scoped_and_ignored_when_pos_record_still_exists(self):
-        collection = SimpleNamespace(delete_many=AsyncMock())
+        collection = SimpleNamespace(update_many=AsyncMock(), delete_many=AsyncMock())
         for records in [[], [{"external_id": "product-a"}]]:
             collection.delete_many.reset_mock()
+            collection.update_many.reset_mock()
             with patch.object(server, "db", {"products": collection}), \
                  patch.object(server, "get_pos_bridge_system_user", new_callable=AsyncMock, return_value={}), \
                  patch.object(server, "expected_pos_scope_for_business", new_callable=AsyncMock, return_value={"business_id": "pos-a", "tenant_id": "tenant-a"}), \
@@ -180,7 +223,9 @@ class ProductionGuardTests(unittest.IsolatedAsyncioTestCase):
             if records:
                 collection.delete_many.assert_not_awaited()
             else:
-                collection.delete_many.assert_awaited_once_with({"business_id": "business-a", "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a", "pos_external_id": "product-a"})
+                self.assertEqual(collection.update_many.call_args.args[0], {"business_id": "business-a", "pos_business_id": "pos-a", "pos_tenant_id": "tenant-a", "pos_external_id": "product-a"})
+                self.assertFalse(collection.update_many.call_args.args[1]["$set"]["source_present"])
+                collection.delete_many.assert_not_awaited()
 
     async def test_native_payment_and_customer_exports_keep_identity_and_values(self):
         scope = {"business_id": "pos-a", "tenant_id": "tenant-a"}

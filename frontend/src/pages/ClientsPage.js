@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useBusiness } from '@/components/layout/DashboardLayout';
 import api, { formatApiError } from '@/lib/api';
 import { toast } from 'sonner';
@@ -23,17 +23,24 @@ const STATUS_COLORS = {
 const emptyForm = { owner_name: '', email: '', phone: '', status: 'active', business_ids: [], notes: '' };
 
 export default function ClientsPage() {
-  const { businesses, selectedBusiness } = useBusiness();
+  const { businesses, businessesLoaded, selectedBusiness } = useBusiness();
   const [clients, setClients] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const requestVersion = useRef(0);
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('all');
   const [sheetOpen, setSheetOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(emptyForm);
+  const missingBusinessIds = businessesLoaded
+    ? (editing?.business_ids || []).filter(id => !businesses.some(business => business.id === id))
+    : [];
 
   const fetchClients = useCallback(async () => {
+    const version = ++requestVersion.current;
     setLoading(true);
+    setError('');
     try {
       const params = {
         business_id: selectedBusiness?.id || undefined,
@@ -41,17 +48,17 @@ export default function ClientsPage() {
         search: search || undefined,
       };
       const { data } = await api.get('/clients', { params });
-      setClients(data);
+      if (version === requestVersion.current) setClients(data);
     } catch (err) {
-      toast.error(`Failed to load clients: ${formatApiError(err)}`);
+      if (version === requestVersion.current) setError(formatApiError(err));
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
   }, [selectedBusiness, status, search]);
 
   useEffect(() => {
     const timer = setTimeout(fetchClients, 300);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); requestVersion.current += 1; };
   }, [fetchClients]);
 
   const openCreate = () => {
@@ -87,10 +94,10 @@ export default function ClientsPage() {
     try {
       if (editing) {
         await api.put(`/clients/${editing.id}`, form);
-        toast.success('Client updated');
+        toast.success('Owner contact updated');
       } else {
         await api.post('/clients', form);
-        toast.success('Client created');
+        toast.success('Owner contact created');
       }
       setSheetOpen(false);
       fetchClients();
@@ -103,7 +110,7 @@ export default function ClientsPage() {
     if (!window.confirm(`Delete client "${client.owner_name}"?`)) return;
     try {
       await api.delete(`/clients/${client.id}`);
-      toast.success('Client deleted');
+      toast.success('Owner contact deleted');
       fetchClients();
     } catch (err) {
       toast.error(formatApiError(err));
@@ -114,13 +121,14 @@ export default function ClientsPage() {
     <div className="space-y-6" data-testid="clients-page">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
         <div>
-          <h1 className="text-2xl font-heading font-semibold text-zinc-950 tracking-tight">Clients</h1>
+          <h1 className="text-2xl font-heading font-semibold text-zinc-950 tracking-tight">Owner contacts</h1>
           <p className="text-sm text-zinc-500 mt-0.5">
-            {selectedBusiness ? `Client owners assigned to ${selectedBusiness.name}` : 'Manage SaaS client owners and business assignments'}
+            {selectedBusiness ? `Owner and organisation contacts linked to ${selectedBusiness.name}` : 'Owner and organisation contacts grouped across businesses'}
           </p>
+          <p className="mt-2 text-sm text-zinc-500">These are contact records, not login accounts. Manage access in Users &amp; Roles and store shoppers in Customers CRM.</p>
         </div>
         <Button onClick={openCreate} className="bg-blue-600 hover:bg-blue-700 gap-2 self-start lg:self-auto" data-testid="add-client-btn">
-          <Plus className="h-4 w-4" /> Add Client
+          <Plus className="h-4 w-4" /> Add owner contact
         </Button>
       </div>
 
@@ -140,7 +148,7 @@ export default function ClientsPage() {
         <Table>
           <TableHeader>
             <TableRow className="bg-zinc-50 hover:bg-zinc-50">
-              <TableHead className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">Client Owner</TableHead>
+              <TableHead className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">Owner / Organisation</TableHead>
               <TableHead className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">Contact</TableHead>
               <TableHead className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">Assigned Businesses</TableHead>
               <TableHead className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">Status</TableHead>
@@ -150,8 +158,8 @@ export default function ClientsPage() {
           <TableBody>
             {loading ? (
               <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-400">Loading...</TableCell></TableRow>
-            ) : clients.length === 0 ? (
-              <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-400">No clients found</TableCell></TableRow>
+              ) : error ? <TableRow><TableCell colSpan={5} role="alert" className="py-8 text-center text-red-700">Clients could not load: {error} <Button variant="outline" onClick={fetchClients}>Retry</Button></TableCell></TableRow> : clients.length === 0 ? (
+                <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-500">{selectedBusiness ? 'No owner contact is linked to this business. Login users and POS customers are managed separately.' : 'No owner contacts match these filters.'}</TableCell></TableRow>
             ) : clients.map(client => (
               <TableRow key={client.id} className="hover:bg-zinc-50/50">
                 <TableCell className="py-3">
@@ -191,8 +199,13 @@ export default function ClientsPage() {
 
       <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
         <SheetContent className="sm:max-w-md">
-          <SheetHeader><SheetTitle className="font-heading">{editing ? 'Edit Client' : 'New Client'}</SheetTitle></SheetHeader>
+          <SheetHeader><SheetTitle className="font-heading">{editing ? 'Edit owner contact' : 'New owner contact'}</SheetTitle></SheetHeader>
           <form onSubmit={saveClient} className="space-y-5 mt-6">
+            {missingBusinessIds.length > 0 && (
+              <p role="status" className="rounded-md bg-amber-50 p-3 text-sm text-amber-900">
+                This client references {missingBusinessIds.length} deleted businesses. Saving as a platform admin removes obsolete assignments.
+              </p>
+            )}
             <div className="space-y-2"><Label>Owner Name</Label><Input value={form.owner_name} onChange={e => setForm({...form, owner_name: e.target.value})} required /></div>
             <div className="space-y-2"><Label>Email</Label><Input type="email" value={form.email} onChange={e => setForm({...form, email: e.target.value})} /></div>
             <div className="space-y-2"><Label>Phone</Label><Input value={form.phone} onChange={e => setForm({...form, phone: e.target.value})} /></div>
@@ -214,7 +227,7 @@ export default function ClientsPage() {
               </div>
             </div>
             <div className="space-y-2"><Label>Notes</Label><Input value={form.notes} onChange={e => setForm({...form, notes: e.target.value})} placeholder="Account notes" /></div>
-            <Button type="submit" className="w-full bg-blue-600 hover:bg-blue-700">{editing ? 'Update Client' : 'Create Client'}</Button>
+            <Button type="submit" className="w-full bg-blue-600 hover:bg-blue-700">{editing ? 'Update owner contact' : 'Create owner contact'}</Button>
           </form>
         </SheetContent>
       </Sheet>

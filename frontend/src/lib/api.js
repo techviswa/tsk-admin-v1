@@ -1,45 +1,34 @@
 import axios from 'axios';
 
-const DEFAULT_BACKEND_URL =
-  process.env.NODE_ENV === 'production'
-    ? 'https://tsk-admin-v1.onrender.com'
-    : 'http://localhost:8000';
+// Both the development proxy and Vercel route /api to the backend. Keep cookies
+// first-party so login also works when browsers block third-party cookies.
+const DEFAULT_BACKEND_URL = '';
 
-const API_URL = (process.env.REACT_APP_BACKEND_URL || DEFAULT_BACKEND_URL).replace(/\/$/, '');
+const API_URL = (process.env.REACT_APP_BACKEND_URL ?? DEFAULT_BACKEND_URL).replace(/\/$/, '');
+
+// Sent on every request; the backend refuses cookie-authenticated writes without it (CSRF protection).
+const CSRF_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
 
 const api = axios.create({
   baseURL: `${API_URL}/api`,
   withCredentials: true,
   timeout: 45000,
-  headers: { 'Content-Type': 'application/json' },
+  headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
 });
 
-const ACCESS_TOKEN_KEY = 'admincore_access_token';
-const REFRESH_TOKEN_KEY = 'admincore_refresh_token';
+// Sessions live only in httpOnly cookies that page scripts cannot read. Tokens stored by older builds are removed.
+const LEGACY_TOKEN_KEYS = ['admincore_access_token', 'admincore_refresh_token'];
 let wakeRequest;
 const wakeBackend = () => {
   if (!wakeRequest) wakeRequest = axios.get(`${API_URL}/api/health`, { timeout: 65000 }).finally(() => { wakeRequest = null; });
   return wakeRequest;
 };
 
-export function setAuthTokens(accessToken, refreshToken) {
-  if (accessToken) localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
-  if (refreshToken) localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
-}
-
 export function clearAuthTokens() {
-  localStorage.removeItem(ACCESS_TOKEN_KEY);
-  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  try { LEGACY_TOKEN_KEYS.forEach((key) => localStorage.removeItem(key)); } catch { /* storage unavailable */ }
 }
 
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (token) {
-    config.headers = config.headers || {};
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
+clearAuthTokens();
 
 api.interceptors.response.use(
   response => response,
@@ -47,7 +36,6 @@ api.interceptors.response.use(
     const original = error.config;
     const status = error?.response?.status;
     const isAuthRequest = original?.url?.startsWith('/auth/login') || original?.url?.startsWith('/auth/register') || original?.url?.startsWith('/auth/refresh');
-    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
     const method = String(original?.method || 'get').toLowerCase();
     const retryableAfterWake = ['get', 'head', 'options'].includes(method);
     const connectionFailed = error?.code === 'ECONNABORTED'
@@ -65,20 +53,17 @@ api.interceptors.response.use(
       }
     }
 
-    if (status === 401 && original && !original._retry && !isAuthRequest && refreshToken) {
+    if (status === 401 && original && !original._retry && !isAuthRequest) {
       original._retry = true;
       try {
-        const { data } = await axios.post(`${API_URL}/api/auth/refresh`, null, {
+        // The refresh cookie is sent automatically; the new session arrives as cookies too.
+        await axios.post(`${API_URL}/api/auth/refresh`, null, {
           withCredentials: true,
-          headers: { 'X-Refresh-Token': refreshToken },
+          headers: CSRF_HEADERS,
           timeout: 15000,
         });
-        setAuthTokens(data.access_token, data.refresh_token);
-        original.headers = original.headers || {};
-        original.headers.Authorization = `Bearer ${data.access_token}`;
         return api(original);
       } catch (refreshError) {
-        if (refreshError.response?.status === 401) clearAuthTokens();
         return Promise.reject(refreshError);
       }
     }
@@ -158,6 +143,7 @@ export function formatApiError(err) {
   if (typeof detail === 'string') return detail;
   if (Array.isArray(detail)) return detail.map(e => e?.msg || formatDetailValue(e)).join(' ');
   if (detail?.msg) return detail.msg;
+  if (detail?.message) return shorten(formatDetailValue(detail.message));
   if (detail?.code) {
     const parts = [detail.code];
     if (detail.module) parts.push(`module: ${detail.module}`);

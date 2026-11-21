@@ -61,10 +61,9 @@ AdminCore is a multi-tenant SaaS admin panel platform designed as a central busi
 5. **Support Admin**: Cross-business view for customer support.
 
 ## Demo Accounts
-- Platform Admin: admin@admin.com / admin123
-- Business Owner: john@sunrise.com / password123
-- Manager: sarah@urban.com / password123
-- Staff: mike@sunrise.com / password123
+Local demo accounts are seeded only in development. Their credentials are written
+to the git-ignored `memory/test_credentials.md` and must never be documented in
+tracked files or used in production.
 
 ## P0 Backlog (High Priority)
 - Permission granularity per module per role

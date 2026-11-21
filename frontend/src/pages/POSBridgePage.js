@@ -42,6 +42,7 @@ function errorText(error) {
 
 export default function POSBridgePage() {
   const { selectedBusiness } = useBusiness();
+  const setupRequired = selectedBusiness?.pos_connection_state === 'setup_required';
   const activeBusinessId = useRef(selectedBusiness?.id);
   activeBusinessId.current = selectedBusiness?.id;
   const [config, setConfig] = useState(null);
@@ -50,7 +51,9 @@ export default function POSBridgePage() {
   const [syncing, setSyncing] = useState('');
   const [lastResult, setLastResult] = useState(null);
   const [previewing, setPreviewing] = useState('');
-  const [livePreview, setLivePreview] = useState(null);
+  const [previewSnapshot, setLivePreview] = useState(null);
+  const livePreview = previewSnapshot?.businessId === selectedBusiness?.id ? previewSnapshot : null;
+  const previewVersion = useRef(0);
   const [queuedJobs, setQueuedJobs] = useState([]);
   const queueActive = queuedJobs.some(job => ['pending', 'retrying', 'running'].includes(job.status));
 
@@ -87,63 +90,74 @@ export default function POSBridgePage() {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
+    previewVersion.current += 1;
+    setLivePreview(null); setPreviewing(''); setSyncing(''); setResources([]);
     setLastResult(null);
     setQueuedJobs([]);
   }, [selectedBusiness?.id]);
   useEffect(() => {
-    if (!queueActive) return undefined;
+    if (!queueActive && !config?.retry_after_seconds) return undefined;
     const timer = setInterval(() => load(true), 10000);
     return () => clearInterval(timer);
-  }, [load, queueActive]);
+  }, [load, queueActive, config?.retry_after_seconds]);
 
   const syncResource = async (resource) => {
+    const businessId = selectedBusiness?.id;
     setSyncing(resource);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
-      const { data } = await api.post(`/pos-bridge/sync/${resource}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
+      const { data } = await api.post(`/pos-bridge/queue/${resource}`, null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
+      if (activeBusinessId.current !== businessId) return;
       setLastResult(data);
-      if (data.status === 'success') toast.success(`${data.count || 0} ${resource} synced`);
+      if (data.status === 'queued') toast.success(`${resource} sync queued`);
+      else if (data.status === 'success') toast.success(`${data.count || 0} ${resource} synced`);
       else toast.error(`${resource}: ${data.count || 0} synced, ${data.error_count || 0} failed`);
       load();
     } catch (err) {
-      toast.error(formatApiError(err));
+      if (activeBusinessId.current === businessId) toast.error(formatApiError(err));
     } finally {
-      setSyncing('');
+      if (activeBusinessId.current === businessId) setSyncing('');
     }
   };
 
   const syncAll = async () => {
+    const businessId = selectedBusiness?.id;
     setSyncing('all');
     setLastResult(null);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
       const { data } = await api.post('/pos-bridge/sync-all', null, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
+      if (activeBusinessId.current !== businessId) return;
       setLastResult(data);
       if (data.status === 'queued') toast.success('POS sync queued');
       else if (data.status === 'success') toast.success('POS bridge sync completed');
       else toast.error(`POS sync incomplete. ${data.skipped_count || 0} resources skipped; review the results and retry.`);
       await load();
     } catch (err) {
-      toast.error(formatApiError(err));
+      if (activeBusinessId.current === businessId) toast.error(formatApiError(err));
     } finally {
-      setSyncing('');
+      if (activeBusinessId.current === businessId) setSyncing('');
     }
   };
 
   const viewLiveResource = async (resource) => {
+    const version = ++previewVersion.current;
+    const businessId = selectedBusiness?.id;
     setPreviewing(resource.key);
     try {
       const params = selectedBusiness ? { business_id: selectedBusiness.id } : {};
       const { data } = await api.get(`/pos-bridge/proxy/${resource.key}`, { params, timeout: POS_BRIDGE_TIMEOUT_MS });
+      if (version !== previewVersion.current || activeBusinessId.current !== businessId) return;
       setLivePreview({
+        businessId,
         resource,
         rows: data.rows || [],
         raw: data.raw,
       });
     } catch (err) {
-      toast.error(formatApiError(err));
+      if (version === previewVersion.current && activeBusinessId.current === businessId) toast.error(formatApiError(err));
     } finally {
-      setPreviewing('');
+      if (version === previewVersion.current && activeBusinessId.current === businessId) setPreviewing('');
     }
   };
 
@@ -173,11 +187,26 @@ export default function POSBridgePage() {
           <Button variant="outline" size="sm" onClick={() => load()} disabled={loading} className="gap-1.5">
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />Refresh
           </Button>
-          <Button size="sm" onClick={syncAll} disabled={!selectedBusiness || !config?.configured || Boolean(syncing) || queueActive} className="gap-1.5 bg-blue-600 hover:bg-blue-700">
+          <Button variant="outline" size="sm" disabled={setupRequired || !selectedBusiness || Boolean(syncing) || queueActive} onClick={async () => {
+            setSyncing('features');
+            try {
+              await api.post(`/pos-bridge/entitlements/${selectedBusiness.id}/retry`);
+              toast.info('Feature access sync queued');
+              await load(true);
+            } catch (error) { toast.error(formatApiError(error)); }
+            finally { setSyncing(''); }
+          }}>Sync feature access</Button>
+          <Button size="sm" onClick={syncAll} disabled={setupRequired || !selectedBusiness || !config?.configured || Boolean(syncing) || queueActive} className="gap-1.5 bg-blue-600 hover:bg-blue-700">
             <RotateCw className={`h-3.5 w-3.5 ${syncing.startsWith('all') ? 'animate-spin' : ''}`} />Sync All
           </Button>
         </div>
       </div>
+
+      {config?.retry_after_seconds > 0 && (
+        <div role="status" className="rounded-md border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+          POS is limiting requests. Queued syncs will retry automatically after the pause (about {Math.ceil(config.retry_after_seconds / 60)} minutes). Saved data remains available.
+        </div>
+      )}
 
       <Card className={`shadow-sm ${config?.configured ? 'border-emerald-200 bg-emerald-50/30' : 'border-amber-200 bg-amber-50/30'}`}>
         <CardContent className="p-5 flex items-start gap-3">
@@ -266,7 +295,7 @@ export default function POSBridgePage() {
                         variant="outline"
                         size="sm"
                         className="h-8 gap-1.5 border-zinc-200"
-                        disabled={!selectedBusiness || !config?.configured || Boolean(previewing)}
+                        disabled={setupRequired || !selectedBusiness || !config?.configured || Boolean(previewing) || config?.retry_after_seconds > 0}
                         onClick={() => viewLiveResource(resource)}
                       >
                         <Eye className={`h-3.5 w-3.5 ${previewing === resource.key ? 'animate-pulse' : ''}`} />Live
@@ -275,7 +304,7 @@ export default function POSBridgePage() {
                         variant="outline"
                         size="sm"
                         className="h-8 gap-1.5 border-zinc-200"
-                        disabled={!selectedBusiness || !config?.configured || Boolean(syncing) || queueActive}
+                        disabled={setupRequired || !selectedBusiness || !config?.configured || Boolean(syncing) || queueActive}
                         onClick={() => syncResource(resource.key)}
                       >
                         <RotateCw className={`h-3.5 w-3.5 ${syncing === resource.key || syncing === `all:${resource.key}` ? 'animate-spin' : ''}`} />Sync
@@ -316,21 +345,21 @@ export default function POSBridgePage() {
                 </div>
               ))}
             </div>
-            <pre className="text-xs whitespace-pre-wrap break-words bg-zinc-50 border border-zinc-200 rounded-md p-3 max-h-72 overflow-auto">
+            <details><summary className="text-sm cursor-pointer">Technical diagnostics</summary><pre className="mt-2 text-xs whitespace-pre-wrap break-words bg-zinc-50 border border-zinc-200 rounded-md p-3 max-h-72 overflow-auto">
               {JSON.stringify(lastResult, null, 2)}
-            </pre>
+            </pre></details>
           </CardContent>
         </Card>
       )}
 
-      <Dialog open={Boolean(livePreview)} onOpenChange={(open) => !open && setLivePreview(null)}>
+      <Dialog open={Boolean(livePreview)} onOpenChange={open => { if (!open) { previewVersion.current += 1; setLivePreview(null); } }}>
         <DialogContent className="max-w-6xl max-h-[86vh] p-0 overflow-hidden">
           <DialogHeader className="px-5 py-4 border-b border-zinc-100">
             <DialogTitle className="font-heading text-lg">
               Live POS Data: {livePreview?.resource?.label}
             </DialogTitle>
             <p className="text-sm text-zinc-500">
-              Direct read from {config?.base_url}/api/{livePreview?.resource?.endpoint}. Nothing here is saved to AdminCore until you click Sync.
+              Live data from POS. Saved records update when a background or requested refresh completes.
             </p>
           </DialogHeader>
           <div className="px-5 py-3 border-b border-zinc-100 flex items-center justify-between">
@@ -338,7 +367,7 @@ export default function POSBridgePage() {
               Rows returned: <span className="font-semibold text-zinc-900">{previewRows.length}</span>
             </div>
             {livePreview?.resource && (
-              <Button size="sm" className="bg-blue-600 hover:bg-blue-700 gap-1.5" disabled={Boolean(syncing)} onClick={() => syncResource(livePreview.resource.key)}>
+              <Button size="sm" className="bg-blue-600 hover:bg-blue-700 gap-1.5" disabled={setupRequired || Boolean(syncing)} onClick={() => syncResource(livePreview.resource.key)}>
                 <RotateCw className={`h-3.5 w-3.5 ${syncing === livePreview.resource.key ? 'animate-spin' : ''}`} />Sync This Resource
               </Button>
             )}

@@ -1,0 +1,174 @@
+--- a/backend/src/database/prisma/helpers.js
++++ b/backend/src/database/prisma/helpers.js
+@@ -110,12 +110,12 @@
+   });
+ };
+ 
+-export const ensurePermissions = async (permissionKeys = []) => {
++export const ensurePermissions = async (permissionKeys = [], client = prisma) => {
+   const uniqueKeys = [...new Set(permissionKeys.filter(Boolean))];
+ 
+   await Promise.all(
+     uniqueKeys.map((key) =>
+-      prisma.permission.upsert({
++      client.permission.upsert({
+         where: { key },
+         update: { label: key },
+         create: { key, label: key },
+@@ -123,7 +123,7 @@
+     ),
+   );
+ 
+-  return prisma.permission.findMany({
++  return client.permission.findMany({
+     where: { key: { in: uniqueKeys } },
+   });
+ };
+@@ -197,10 +197,10 @@
+   await accessControlSeedPromise;
+ };
+ 
+-export const syncUserPermissions = async (userId, permissionKeys = []) => {
+-  const permissions = await ensurePermissions(permissionKeys);
+-
+-  await prisma.userPermission.deleteMany({
++export const syncUserPermissions = async (userId, permissionKeys = [], client = prisma) => {
++  const permissions = await ensurePermissions(permissionKeys, client);
++
++  await client.userPermission.deleteMany({
+     where: { userId },
+   });
+ 
+@@ -208,7 +208,7 @@
+     return;
+   }
+ 
+-  await prisma.userPermission.createMany({
++  await client.userPermission.createMany({
+     data: permissions.map((permission) => ({
+       userId,
+       permissionId: permission.id,
+@@ -216,10 +216,10 @@
+   });
+ };
+ 
+-export const syncUserOutlets = async (userId, outletIds = []) => {
++export const syncUserOutlets = async (userId, outletIds = [], client = prisma) => {
+   const uniqueOutletIds = [...new Set((outletIds || []).filter(Boolean))];
+ 
+-  await prisma.userOutletAssignment.deleteMany({
++  await client.userOutletAssignment.deleteMany({
+     where: { userId },
+   });
+ 
+@@ -229,7 +229,7 @@
+ 
+   await Promise.all(
+     uniqueOutletIds.map((outletId) =>
+-      prisma.userOutletAssignment.upsert({
++      client.userOutletAssignment.upsert({
+         where: {
+           userId_outletId: {
+             userId,
+--- a/backend/src/core/users/users.service.js
++++ b/backend/src/core/users/users.service.js
+@@ -292,41 +292,29 @@
+       }
+     }
+ 
+-    await prisma.user.update({
+-      where: { id: userId },
+-      data: {
+-        name: payload.name ?? currentUser.name,
+-        email: nextEmail,
+-        passwordHash: nextPasswordHash,
+-        roleId,
+-        profileRequired: payload.profile_required ?? currentUser.profileRequired,
+-        active: payload.active ?? currentUser.active,
+-        bio: payload.bio ?? currentUser.bio,
+-      },
+-    });
+-
+-    if (payload.permissions !== undefined) {
+-      await syncUserPermissions(userId, payload.permissions || []);
+-    }
+-
+-    if (assignedOutletIds !== undefined) {
+-      await syncUserOutlets(userId, assignedOutletIds);
+-    }
+-
+-    if (payload.password !== undefined || payload.active === false) {
+-      await prisma.authSession.deleteMany({ where: { userId } });
+-    }
+-
+-    const user = await prisma.user.findUniqueOrThrow({
+-      where: { id: userId },
+-      include: getUserInclude(),
+-    });
+-
+-    const result = serializeUser(user);
+-    await admincoreChangeSyncService.notifyChange({
+-      resource: "staff", action: "updated", recordId: userId, tenantId, businessId: business.id,
+-    });
+-    return result;
++    return prisma.$transaction(async (tx) => {
++      await tx.user.update({
++        where: { id: userId },
++        data: {
++          name: payload.name ?? currentUser.name, email: nextEmail,
++          passwordHash: nextPasswordHash, roleId,
++          profileRequired: payload.profile_required ?? currentUser.profileRequired,
++          active: payload.active ?? currentUser.active, bio: payload.bio ?? currentUser.bio,
++        },
++      });
++      if (payload.permissions !== undefined) await syncUserPermissions(userId, payload.permissions || [], tx);
++      if (assignedOutletIds !== undefined) await syncUserOutlets(userId, assignedOutletIds, tx);
++      if (payload.password !== undefined || payload.active === false || roleChanged) {
++        await tx.authSession.deleteMany({ where: { userId } });
++      }
++      const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, include: getUserInclude() });
++      // Persist the notification in the same database transaction as the credentials.
++      // A failure rolls back the password, access changes and session revocation.
++      await admincoreChangeSyncService.notifyChange({
++        resource: "staff", action: "updated", recordId: userId, tenantId, businessId: business.id,
++      }, { tx });
++      return serializeUser(user);
++    });
+   }
+ 
+   async deleteUser({ tenantId, businessId, userId, actor }) {
+--- a/backend/scripts/user-admin-policy-tests.mjs
++++ b/backend/scripts/user-admin-policy-tests.mjs
+@@ -2,6 +2,7 @@
+ import { randomUUID } from "node:crypto";
+ import prisma from "../src/database/prisma/client.js";
+ import { usersService } from "../src/core/users/users.service.js";
++import { admincoreChangeSyncService } from "../src/core/admincore/admincore-change-sync.service.js";
+ 
+ const businessId = `users-policy-${randomUUID()}`;
+ const otherBusinessId = `users-policy-other-${randomUUID()}`;
+@@ -31,6 +32,24 @@
+   assert.equal(afterConflict.email, beforeConflict.email);
+   assert.equal(afterConflict.passwordHash, beforeConflict.passwordHash);
+   assert.equal(afterConflict.name, beforeConflict.name);
++
++  // Outbox failure must not leave a changed password or revoke the old session.
++  const sessionHash = randomUUID();
++  await prisma.authSession.create({ data: { tokenHash: sessionHash, userId: waiter.id, expiresAt: new Date(Date.now() + 60000) } });
++  const notify = admincoreChangeSyncService.notifyChange;
++  admincoreChangeSyncService.notifyChange = async (_event, options) => {
++    assert.ok(options?.tx, "profile notifications must participate in the credential transaction");
++    throw new Error("fixture outbox failure");
++  };
++  try {
++    await assert.rejects(usersService.updateUser({ ...scope(businessId), userId: waiter.id,
++      payload: { password: "must-roll-back-password", name: "Must roll back" } }), /fixture outbox failure/);
++  } finally { admincoreChangeSyncService.notifyChange = notify; }
++  const afterFailure = await prisma.user.findUniqueOrThrow({ where: { id: waiter.id } });
++  assert.equal(afterFailure.passwordHash, beforeConflict.passwordHash);
++  assert.equal(afterFailure.name, beforeConflict.name);
++  assert.equal(await prisma.authSession.count({ where: { tokenHash: sessionHash } }), 1);
++  await prisma.authSession.delete({ where: { tokenHash: sessionHash } });
+ 
+   // P0: self-service profile edit must not be a privilege-escalation path.
+   const edited = await usersService.updateOwnProfile({ ...scope(businessId), userId: waiter.id, payload: {

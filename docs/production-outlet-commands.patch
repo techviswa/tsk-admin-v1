@@ -1,0 +1,435 @@
+--- a/backend/src/core/outlets/outlets.service.js
++++ b/backend/src/core/outlets/outlets.service.js
+@@ -1,4 +1,5 @@
+ import prisma from "../../database/prisma/client.js";
++import { operationalWrite } from "../../shared/utils/operational-write.js";
+ import { moveStock } from "../inventory/stock-ledger.service.js";
+ import { assertOwnedIds } from "../../database/prisma/scope.js";
+ import { createHttpError } from "../../shared/utils/http-error.js";
+@@ -332,9 +333,9 @@
+     };
+   }
+ 
+-  async getOutletRecord({ tenantId, outletId }) {
++  async getOutletRecord({ tenantId, outletId, client = prisma }) {
+     const business = await ensureBusiness({ tenantId });
+-    const outlet = await prisma.outlet.findFirstOrThrow({
++    const outlet = await client.outlet.findFirstOrThrow({
+       where: {
+         id: outletId,
+         businessId: business.id,
+@@ -348,23 +349,23 @@
+     return { business, outlet };
+   }
+ 
+-  async getOutletById({ tenantId, outletId }) {
+-    const { business, outlet } = await this.getOutletRecord({ tenantId, outletId });
+-    const purchaseOrderCount = await prisma.purchaseOrder.count({
++  async getOutletById({ tenantId, outletId, client = prisma }) {
++    const { business, outlet } = await this.getOutletRecord({ tenantId, outletId, client });
++    const purchaseOrderCount = await client.purchaseOrder.count({
+       where: {
+         businessId: business.id,
+         outletId,
+         status: { in: ["pending", "approved"] },
+       },
+     });
+-    const allocationCount = await prisma.allocation.count({
++    const allocationCount = await client.allocation.count({
+       where: {
+         businessId: business.id,
+         outletId,
+       },
+     });
+     const orderOutletMap = new Map((outlet.orders || []).map((order) => [order.id, outlet.id]));
+-    const bills = await prisma.bill.findMany({
++    const bills = await client.bill.findMany({
+       where: {
+         businessId: business.id,
+       },
+@@ -409,125 +410,124 @@
+     });
+   }
+ 
+-  async createOutlet({ tenantId, payload, transaction = null }) {
++  async createOutlet({ tenantId, payload, transaction = null, sourceOutletId = null, commandId = null }) {
+     const business = await ensureBusiness({ tenantId });
+-    const createdOutlet = await prisma.outlet.create({
+-      data: {
+-        businessId: business.id,
+-        name: payload.name || "New Outlet",
+-        code: payload.code || `OUT${Date.now()}`.slice(-8),
+-        location: payload.location || "",
+-        managerName: payload.manager_name || "",
+-        phone: payload.phone || "",
+-        status: payload.status || DEFAULT_OUTLET_STATUS,
+-      },
+-    });
+-
+-    await syncOutletAssignments(createdOutlet.id, await assertOwnedIds({ kind: "user", ids: payload.assigned_user_ids, businessId: business.id }));
+-
+-    const [products, inventoryItems] = await Promise.all([
+-      prisma.product.findMany({ where: { businessId: business.id } }),
+-      prisma.inventoryItem.findMany({ where: { businessId: business.id } }),
+-    ]);
+-
+-    if (products.length) {
+-      await prisma.outletProduct.createMany({
+-        data: products.map((product) => ({
++    const work = async tx => {
++      if (sourceOutletId) {
++        const existing = await tx.outlet.findUnique({ where: { id: sourceOutletId } });
++        if (existing) {
++          if (existing.businessId !== business.id) throw createHttpError({ statusCode: 409, code: "OUTLET_IDENTITY_CONFLICT", message: "Outlet identity belongs to another business" });
++          return { id: existing.id };
++        }
++      }
++      const createdOutlet = await tx.outlet.create({
++        data: {
++          ...(sourceOutletId ? { id: sourceOutletId } : {}),
++          businessId: business.id,
++          name: payload.name || "New Outlet",
++          code: payload.code || `OUT${Date.now()}`.slice(-8),
++          location: payload.location || "",
++          managerName: payload.manager_name || "",
++          phone: payload.phone || "",
++          status: payload.status || DEFAULT_OUTLET_STATUS,
++        },
++      });
++
++      await syncOutletAssignments(createdOutlet.id, await assertOwnedIds({ kind: "user", ids: payload.assigned_user_ids, businessId: business.id, client: tx }), tx);
++
++      const [products, inventoryItems] = await Promise.all([
++        tx.product.findMany({ where: { businessId: business.id } }),
++        tx.inventoryItem.findMany({ where: { businessId: business.id } }),
++      ]);
++
++      if (products.length) {
++        await tx.outletProduct.createMany({
++          data: products.map((product) => ({
++            outletId: createdOutlet.id,
++            productId: product.id,
++            enabled: true,
++            priceOverride: null,
++          })),
++          skipDuplicates: true,
++        });
++      }
++
++      if (inventoryItems.length) {
++        await tx.outletInventory.createMany({
++          data: inventoryItems.map((item) => ({
++            outletId: createdOutlet.id,
++            inventoryItemId: item.id,
++            stock: 0,
++            reorderLevel: item.reorderLevel || 0,
++            enabled: true,
++          })),
++          skipDuplicates: true,
++        });
++      }
++
++      await tx.outletFeatureToggle.createMany({
++        data: FEATURE_REGISTRY.map((feature) => ({
+           outletId: createdOutlet.id,
+-          productId: product.id,
+-          enabled: true,
+-          priceOverride: null,
+-        })),
+-        skipDuplicates: true,
+-      });
+-    }
+-
+-    if (inventoryItems.length) {
+-      await prisma.outletInventory.createMany({
+-        data: inventoryItems.map((item) => ({
+-          outletId: createdOutlet.id,
+-          inventoryItemId: item.id,
+-          stock: 0,
+-          reorderLevel: item.reorderLevel || 0,
++          featureKey: feature.key,
+           enabled: true,
+         })),
+         skipDuplicates: true,
+       });
+-    }
+-
+-    await prisma.outletFeatureToggle.createMany({
+-      data: FEATURE_REGISTRY.map((feature) => ({
+-        outletId: createdOutlet.id,
+-        featureKey: feature.key,
+-        enabled: true,
+-      })),
+-      skipDuplicates: true,
+-    });
+-
+-    const outlet = await this.getOutletById({
+-      tenantId,
+-      outletId: createdOutlet.id,
+-    });
+-    await admincoreChangeSyncService.notifyChange({
+-      resource: "outlets",
+-      action: "created",
+-      recordId: outlet.id,
+-      tenantId,
+-      businessId: business.id,
+-      outletId: outlet.id,
+-      metadata: {
+-        name: outlet.name,
+-        code: outlet.code,
+-        status: outlet.status,
+-      },
+-    }, transaction ? { tx: transaction } : undefined);
+-
+-    return outlet;
+-  }
+-
+-  async updateOutlet({ tenantId, outletId, payload }) {
++
++      const outlet = createdOutlet;
++      await admincoreChangeSyncService.notifyChange({
++        resource: "outlets",
++        action: "created",
++        recordId: outlet.id,
++        tenantId,
++        businessId: business.id,
++        outletId: outlet.id,
++        metadata: {
++          name: outlet.name,
++          code: outlet.code,
++          status: outlet.status,
++        },
++      }, { tx });
++
++      return { id: outlet.id };
++    };
++    const result = transaction ? await work(transaction) : await operationalWrite({
++      businessId: business.id, kind: "outlet-create", payload: { ...payload, ...(commandId ? { request_id: commandId } : {}) },
++    }, work);
++    return this.getOutletById({ tenantId, outletId: result.id, client: transaction || prisma });
++  }
++
++  async updateOutlet({ tenantId, outletId, payload, commandId = null, expectedUpdatedAt = null }) {
+     const { business, outlet } = await this.getOutletRecord({ tenantId, outletId });
+-
+-    await prisma.outlet.update({
+-      where: { id: outletId },
+-      data: {
+-        name: payload.name ?? outlet.name,
+-        code: payload.code ?? outlet.code,
+-        location: payload.location ?? outlet.location,
+-        managerName: payload.manager_name ?? outlet.managerName,
+-        phone: payload.phone ?? outlet.phone,
+-        status: payload.status ?? outlet.status,
+-      },
+-    });
+-
+-    if (payload.assigned_user_ids !== undefined) {
+-      await syncOutletAssignments(outletId, await assertOwnedIds({ kind: "user", ids: payload.assigned_user_ids, businessId: business.id }));
+-    }
+-
+-    const outletResult = await this.getOutletById({ tenantId, outletId });
+-    await admincoreChangeSyncService.notifyChange({
+-      resource: "outlets",
+-      action: "updated",
+-      recordId: outletResult.id,
+-      tenantId,
+-      businessId: outlet.businessId,
+-      outletId: outletResult.id,
+-      metadata: {
+-        name: outletResult.name,
+-        code: outletResult.code,
+-        status: outletResult.status,
+-      },
+-    });
+-
+-    return outletResult;
+-  }
+-
+-  async deleteOutlet({ tenantId, outletId }) {
+-    return this.updateOutlet({
+-      tenantId,
+-      outletId,
+-      payload: { status: "inactive" },
+-    });
++    await operationalWrite({ businessId: business.id, kind: `outlet-update:${outletId}`,
++      payload: { ...payload, ...(commandId ? { request_id: commandId } : {}) } }, async tx => {
++      const changed = await tx.outlet.updateMany({
++        where: { id: outletId, businessId: business.id, updatedAt: expectedUpdatedAt ? new Date(expectedUpdatedAt) : outlet.updatedAt },
++        data: {
++          name: payload.name ?? outlet.name,
++          code: payload.code ?? outlet.code,
++          location: payload.location ?? outlet.location,
++          managerName: payload.manager_name ?? outlet.managerName,
++          phone: payload.phone ?? outlet.phone,
++          status: payload.status ?? outlet.status,
++        },
++      });
++      if (changed.count !== 1) throw createHttpError({ statusCode: 409, code: "OUTLET_VERSION_CONFLICT", message: "The outlet changed while you were editing. Reload it before saving." });
++      if (payload.assigned_user_ids !== undefined) {
++        const ids = await assertOwnedIds({ kind: "user", ids: payload.assigned_user_ids, businessId: business.id, client: tx });
++        await syncOutletAssignments(outletId, ids, tx);
++      }
++      await admincoreChangeSyncService.notifyChange({ resource: "outlets", action: "updated", recordId: outletId,
++        tenantId, businessId: business.id, outletId,
++        metadata: { name: payload.name ?? outlet.name, code: payload.code ?? outlet.code, status: payload.status ?? outlet.status },
++      }, { tx });
++      return { id: outletId };
++    });
++    return this.getOutletById({ tenantId, outletId });
++  }
++
++  async deleteOutlet({ tenantId, outletId, commandId = null, expectedUpdatedAt = null }) {
++    return this.updateOutlet({ tenantId, outletId, commandId, expectedUpdatedAt, payload: { status: "inactive" } });
+   }
+ 
+   async assignUsers({ tenantId, outletId, userIds }) {
+--- a/backend/src/database/prisma/helpers.js
++++ b/backend/src/database/prisma/helpers.js
+@@ -250,10 +250,10 @@
+   );
+ };
+ 
+-export const syncOutletAssignments = async (outletId, userIds = []) => {
++export const syncOutletAssignments = async (outletId, userIds = [], client = prisma) => {
+   const uniqueUserIds = [...new Set((userIds || []).filter(Boolean))];
+ 
+-  await prisma.userOutletAssignment.deleteMany({
++  await client.userOutletAssignment.deleteMany({
+     where: { outletId },
+   });
+ 
+@@ -263,7 +263,7 @@
+ 
+   await Promise.all(
+     uniqueUserIds.map((userId) =>
+-      prisma.userOutletAssignment.upsert({
++      client.userOutletAssignment.upsert({
+         where: {
+           userId_outletId: {
+             userId,
+--- a/backend/src/core/admincore/admincore.controller.js
++++ b/backend/src/core/admincore/admincore.controller.js
+@@ -132,11 +132,23 @@
+   sendRawResponse(res, { data });
+ };
+ 
++const outletCommand = req => {
++  const sourceOutletId = req.body?.admincore_outlet_id || null;
++  const commandId = req.body?.admincore_command_id || (req.method === "POST" ? sourceOutletId : null);
++  const expectedUpdatedAt = req.body?.expected_updated_at || null;
++  if (sourceOutletId && !/^aco_[a-f0-9]{32}$/.test(sourceOutletId)) throw createHttpError({ statusCode: 400, message: "Invalid AdminCore outlet identity" });
++  if (commandId && !/^[a-zA-Z0-9_-]{8,100}$/.test(commandId)) throw createHttpError({ statusCode: 400, message: "Invalid outlet command identifier" });
++  if (expectedUpdatedAt && !Number.isFinite(Date.parse(expectedUpdatedAt))) throw createHttpError({ statusCode: 400, message: "Invalid expected outlet version" });
++  if (commandId && ["PUT", "DELETE"].includes(req.method) && !expectedUpdatedAt) throw createHttpError({ statusCode: 400, message: "A source outlet version is required for this command" });
++  return { sourceOutletId, commandId, expectedUpdatedAt };
++};
++
+ export const postBridgeOutlet = async (req, res) => {
+   const { tenantId } = await getBridgeTenantContext(req, "OUTLET");
+   const data = await outletsService.createOutlet({
+     tenantId,
+     payload: req.body,
++    ...outletCommand(req),
+   });
+   sendRawResponse(res, { statusCode: 201, data });
+ };
+@@ -147,6 +159,7 @@
+     tenantId,
+     outletId: req.params.outletId,
+     payload: req.body,
++    ...outletCommand(req),
+   });
+   sendRawResponse(res, { data });
+ };
+@@ -157,6 +170,7 @@
+   const data = await outletsService.deleteOutlet({
+     tenantId,
+     outletId: req.params.outletId,
++    ...outletCommand(req),
+   });
+   sendRawResponse(res, { data });
+ };
+--- a/backend/src/core/admincore/admincore.routes.js
++++ b/backend/src/core/admincore/admincore.routes.js
+@@ -48,7 +48,7 @@
+ 
+ router.get("/connection", asyncHandler(getConnection));
+ router.get("/health", asyncHandler(getHealth));
+-router.get("/capabilities", requireAdmincoreBridgeKey, (_req, res) => res.json({ success: true, data: { product_commands: 1, export_paging: 2 } }));
++router.get("/capabilities", requireAdmincoreBridgeKey, (_req, res) => res.json({ success: true, data: { product_commands: 1, outlet_commands: 1, export_paging: 2 } }));
+ router.post("/sync-status", requireAdmincoreBridgeKey, asyncHandler(postSyncStatus));
+ router.post("/tenants", requireAdmincoreBridgeKey, asyncHandler(postSaasTenant));
+ router.post("/staff", requireAdmincoreBridgeKey, asyncHandler(postBridgeStaff));
+--- /dev/null
++++ b/backend/scripts/outlet-command-tests.mjs
+@@ -0,0 +1,69 @@
++import assert from 'node:assert/strict';
++import { randomUUID } from 'node:crypto';
++import prisma from '../src/database/prisma/client.js';
++import env from '../src/config/env.js';
++import { connectDatabase } from '../src/config/db.js';
++import { runTenantScope } from '../src/database/prisma/tenant-context.js';
++import { outletsService } from '../src/core/outlets/outlets.service.js';
++import { admincoreChangeSyncService } from '../src/core/admincore/admincore-change-sync.service.js';
++
++const businessId = `outlet-command-check-${randomUUID()}`, tenantId = `tenant-${businessId}`;
++const scoped = fn => runTenantScope({ businessId, tenantId }, fn);
++const enabled = env.admincore.enabled;
++const originalNotify = admincoreChangeSyncService.notifyChange;
++try {
++  env.admincore.enabled = false;
++  await connectDatabase();
++  await prisma.business.create({ data: { id: businessId, tenantId, name: 'Isolated outlet command check' } });
++  await scoped(async () => {
++    await prisma.product.create({ data: { businessId, name: 'Preserved menu item', category: 'Test', price: 10, stock: 5 } });
++    const sourceOutletId = 'aco_' + randomUUID().replaceAll('-', '');
++    const commandId = randomUUID();
++    const create = () => outletsService.createOutlet({ tenantId, sourceOutletId, commandId,
++      payload: { name: 'Fixture outlet', code: randomUUID().slice(0, 8) } });
++    // A replay uses exactly the same request body, including the generated code.
++    const payload = { name: 'Fixture outlet', code: randomUUID().slice(0, 8) };
++    const sameCreate = () => outletsService.createOutlet({ tenantId, sourceOutletId, commandId, payload });
++    const [first, replay] = await Promise.all([sameCreate(), sameCreate()]);
++    assert.equal(first.id, sourceOutletId); assert.equal(replay.id, sourceOutletId);
++    assert.equal(await prisma.outlet.count({ where: { businessId } }), 1);
++    assert.equal(first.products.length, 1); assert(first.features.length > 0);
++    const updateId = randomUUID();
++    const change = () => outletsService.updateOutlet({ tenantId, outletId: first.id, commandId: updateId,
++      expectedUpdatedAt: first.updated_at, payload: { name: 'Confirmed name', assigned_user_ids: [] } });
++    const changed = await change();
++    assert.equal((await change()).name, 'Confirmed name');
++    assert.equal(changed.products.length, 1); assert.equal(changed.features.length, first.features.length);
++    await assert.rejects(outletsService.updateOutlet({ tenantId, outletId: first.id, commandId: randomUUID(),
++      expectedUpdatedAt: first.updated_at, payload: { name: 'Stale edit' } }), error => error.code === 'OUTLET_VERSION_CONFLICT');
++    await assert.rejects(outletsService.updateOutlet({ tenantId, outletId: first.id,
++      payload: { name: 'Must roll back', assigned_user_ids: ['unknown-user'] } }), error => error.code === 'REFERENCE_NOT_IN_BUSINESS');
++    assert.equal((await outletsService.getOutletById({ tenantId, outletId: first.id })).name, 'Confirmed name');
++    admincoreChangeSyncService.notifyChange = async () => { throw new Error('outbox unavailable'); };
++    await assert.rejects(create(), /outbox unavailable|request was already submitted/);
++    await assert.rejects(outletsService.createOutlet({ tenantId, payload: { name: 'Must roll back', code: randomUUID().slice(0, 8) } }), /outbox unavailable/);
++    await assert.rejects(outletsService.updateOutlet({ tenantId, outletId: first.id, payload: { phone: 'must-not-save' } }), /outbox unavailable/);
++    admincoreChangeSyncService.notifyChange = originalNotify;
++    assert.equal(await prisma.outlet.count({ where: { businessId } }), 1);
++    assert.equal((await outletsService.getOutletById({ tenantId, outletId: first.id })).phone, '');
++    await assert.rejects(prisma.$transaction(async tx => {
++      const nested = await outletsService.createOutlet({ tenantId, transaction: tx, payload: { name: 'Nested rollback', code: randomUUID().slice(0, 8) } });
++      assert.equal(nested.products.length, 1);
++      assert(nested.features.length > 0);
++      throw new Error('parent rollback');
++    }), /parent rollback/);
++    assert.equal(await prisma.outlet.count({ where: { businessId } }), 1);
++    const archived = await outletsService.deleteOutlet({ tenantId, outletId: first.id, commandId: randomUUID(), expectedUpdatedAt: changed.updated_at });
++    assert.equal(archived.status, 'inactive'); assert.equal(archived.products.length, 1);
++  });
++  console.log('Outlet commands passed: concurrent create replay, stale edits, atomic assignment/outbox rollback, parent transaction rollback, preserved menu/features and historical deactivation');
++} finally {
++  env.admincore.enabled = enabled;
++  admincoreChangeSyncService.notifyChange = originalNotify;
++  await scoped(async () => {
++    await prisma.stateDocument.deleteMany({ where: { data: { path: ['business_id'], equals: businessId } } });
++    await prisma.adminCoreSyncLog.deleteMany({ where: { tenantId } });
++    await prisma.business.deleteMany({ where: { id: businessId } });
++  });
++  await prisma.$disconnect();
++}

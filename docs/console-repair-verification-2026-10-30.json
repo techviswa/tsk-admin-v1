@@ -1,0 +1,90 @@
+{
+  "result": "console_repairs_passed_with_legacy_connection_review_required",
+  "verified_at_utc": "2026-10-30T15:19:56.812508+00:00",
+  "published_or_deployed": false,
+  "tested_working_tree": {
+    "admincore": {
+      "selected_source_files": 195,
+      "sha256": "49623677bb6a22a18214307808d26cf882592b987f36ab19d689b78b06ad31f2"
+    },
+    "pos": {
+      "selected_source_files": 559,
+      "sha256": "3f558b092c7a341eff0ec60811e315933ab6e84fc6cf59a0fde3c3c4cda38b72"
+    }
+  },
+  "tests": {
+    "admincore_backend": 265,
+    "admincore_frontend": 39,
+    "pos_frontend": 84,
+    "pos_frontend_note": "No POS frontend changes in this correction; previous 84-test and build evidence retained.",
+    "production_builds": "AdminCore final build passed; unchanged POS frontend build evidence retained",
+    "browser": "29 screens, populated audit rows and record details, invoice identity, desktop/mobile layouts and incomplete-connection guard passed",
+    "paired_runs": [
+      {
+        "run_id": "3da910da33514030a95df5b1415e0d3e",
+        "result": "passed",
+        "pos_release_suite": "passed",
+        "offline_browser": "not_requested",
+        "credential_create_and_update_replay": "passed",
+        "privacy_erasure_delivery": "passed",
+        "multi_till_stock_recovery": "passed",
+        "frozen_exports": "passed"
+      },
+      {
+        "run_id": "8b38ff6894984295aeca1c0424b727c5",
+        "result": "passed",
+        "pos_release_suite": "not_requested",
+        "offline_browser": "not_requested",
+        "credential_create_and_update_replay": "passed",
+        "privacy_erasure_delivery": "passed",
+        "multi_till_stock_recovery": "passed",
+        "frozen_exports": "passed"
+      }
+    ],
+    "restore": "63 PostgreSQL table row hashes and MongoDB BSON/index proof passed in both paired runs"
+  },
+  "local_data": {
+    "original_business_product_table_ids_retained": true,
+    "counts_unchanged": {
+      "businesses": 3,
+      "users": 27,
+      "outlets": 13,
+      "products": 46,
+      "pos_bills": 9,
+      "pos_tables": 5
+    }
+  },
+  "confirmed_local_data_facts": {
+    "stored_invoices": 9,
+    "zero_value_invoices": 8,
+    "official_invoice_numbers": 0,
+    "invoice_total": 578,
+    "imported_payment_records": 0,
+    "commercial_client_records": 0
+  },
+  "local_services": {
+    "admincore_ui": "http://localhost:3001",
+    "admincore_api": 8000,
+    "pos_api": 4001,
+    "pos_frontend_started": false,
+    "authenticated_bridge_healthy": true,
+    "global_operations_health_http_status": 503
+  },
+  "known_connection_review": {
+    "businesses": 1,
+    "reason": "An inherited credential-test business has no tenant mapping and no matching POS source. Records and the failed-job diagnostic were retained; automatic invalid refreshes are prevented. Global health remains 503."
+  },
+  "history_paging": {
+    "isolated_test_records": 201,
+    "live_legacy_history_exercised": false
+  },
+  "remaining_release_gates": [
+    "Legacy connection data review",
+    "Exact-revision paired remote CI",
+    "Hosted configuration, secrets, HTTPS/MFA and restore/rollback/alerts",
+    "Payment-provider approval",
+    "Physical devices/printers",
+    "Business acceptance of financial and offline rules"
+  ],
+  "limits": "Evidence covers these cases and working-tree files; it is not a guarantee that every workflow is defect-free. Offline browser checkout was not rerun in this batch; previous evidence is separate."
+}

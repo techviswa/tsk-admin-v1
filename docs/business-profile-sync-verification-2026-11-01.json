@@ -1,0 +1,81 @@
+{
+  "date": "2026-11-01",
+  "result": "passed",
+  "scope": "Shared business profile, personal display name, merchant identity display, durable cross-project sync and Settings integrity",
+  "tests": {
+    "pos_frontend": 113,
+    "admin_frontend": 44,
+    "admin_backend": 261,
+    "admin_backend_subtests": 28,
+    "admin_backend_skipped": 8
+  },
+  "ci_builds": {
+    "pos": "passed",
+    "admincore": "passed"
+  },
+  "isolated_api": {
+    "result": "passed",
+    "run_id": "aced03a0e6b142f08c1014c131927ae4",
+    "business_profile_roundtrip": "passed",
+    "checks": [
+      "POS Settings API write persists",
+      "waiter sees saved business name but cannot edit settings",
+      "durable business/contact export reaches AdminCore",
+      "personal account name reaches AdminCore without changing email or role",
+      "invalid account names rejected",
+      "AdminCore rename reaches POS",
+      "stale revision rejected",
+      "wrong tenant and unsigned bridge rejected",
+      "plan and lifecycle preserved"
+    ],
+    "business_data_scope": "disposable databases only"
+  },
+  "live_browser": {
+    "result": "passed",
+    "widths": [
+      1440,
+      390
+    ],
+    "checks": [
+      "Header/sidebar names",
+      "Settings and Billing identity",
+      "Dirty draft preservation",
+      "All Settings cards fit mobile",
+      "AdminCore name and contact details",
+      "No runtime or API errors"
+    ],
+    "business_records_saved": false
+  },
+  "existing_record_ids_preserved": true,
+  "data_reset": false,
+  "schema_migration": false,
+  "features_removed": [],
+  "deployed": false,
+  "local_urls": {
+    "admincore": "http://localhost:3001",
+    "pos": "http://localhost:3002"
+  },
+  "legacy_data": "Actual unscoped browser entries retained for explicit review; defaults never invented for migration",
+  "source_sha256": {
+    "admin:backend/server.py": "66d3b2cc4484c9f497f7c9bbc4de235c721d21aae801e6fad0229235638df4b5",
+    "admin:frontend/src/components/layout/DashboardLayout.js": "9f64cad5246d2f17a540239a3987e85c4cd125dbb051ef59d1debbc1913fe341",
+    "admin:frontend/src/pages/BusinessesPage.js": "cca151d880c1b4e69fde592058ed93c7ebdc92625bd984ed243361c1c27b8724",
+    "admin:tests/coupled_api_check.py": "b0e647b89da97e21a3c996081b79468c807526933b61b7d121abe56b7978b313",
+    "pos:backend/src/core/businesses/business-profile.js": "3a4fe7cfd407c1a513ddd2fd33ae2e889b6eb6036613f60297d52054955df45d",
+    "pos:backend/src/core/businesses/businesses.service.js": "3ecd916846e7db7e6d8de870d6fcddce1c737ceeee6e1fa8c9de939d225fef1a",
+    "pos:backend/src/core/businesses/businesses.routes.js": "4bcd98ef0cea8b5db7eff05cf76fa0a4ef55f5de07f24e634b92c7f580ad2025",
+    "pos:backend/src/core/businesses/businesses.controller.js": "5fc86e5be03d9269cc9ed257a3258a9645c7c82415576c9b588ec834ac5d627c",
+    "pos:backend/src/core/admincore/admincore.routes.js": "3b4440dc962199b2957e9156fa07abef18cbfcfdf93728b6dfc758a3b25b0b93",
+    "pos:backend/src/core/users/users.service.js": "6393bc977bd50b19b66c27c7e3f43488ae386f47480f5ed141abf832a7a837b8",
+    "pos:backend/src/database/prisma/tenant-guard.js": "7e7f6b0ae20c7bde87455076786ebcd19a916e240f8bb7f14666a2863f2f1de1",
+    "pos:backend/src/database/prisma/rls-runtime.js": "889bd5c8b789d0282466e5e5f6c66abc0df76d8c87ebc48c829878ca30b98d7a",
+    "pos:frontend/src/contexts/AuthContext.js": "947a051405d6d3cb9a3e683a9f4c1985021d4e8ff8050e48706d2eb994e383aa",
+    "pos:frontend/src/contexts/UiContext.js": "9b08d2a31f04a1e632a7a5ee66ef97287f8d82a7340ae9a4d0361f6823ff163e",
+    "pos:frontend/src/contexts/UiContext.test.js": "fd5d51be7b868d0be0e0ef63f5111cb1e6edae5f7c5b1c8126023c1d3360383d",
+    "pos:frontend/src/components/Layout.js": "2ba9b89ab6c0ecdd2e1f1ca0626f4fce553b7be7cb15ac62af82a147475fb9d9",
+    "pos:frontend/src/pages/Settings.js": "4b109aaa03fde1e1a5b7b37af6940db8c4139bac85ff7b1010ad9b38c72670e9",
+    "pos:frontend/src/pages/Settings.profile.test.js": "756dd6b95f5cff1762039cc09da278f1aec4fe1fb587912403dbe228c747cfa9",
+    "pos:frontend/src/lib/pos.js": "ffa535021312c9e1d77eb93924232d81d3b56bff32836ec9d079e79d57c2fef5",
+    "pos:frontend/src/App.css": "ba023383f883c675dfe9cb2ee71753670b73ccad3e029b2b4f94e3c012371ece"
+  }
+}

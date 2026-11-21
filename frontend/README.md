@@ -1,4 +1,23 @@
-# Getting Started with Create React App
+# AdminCore frontend
+
+## Running this project locally
+
+Run `npm run dev` from the repository root, then open http://localhost:3001.
+The root command starts only the AdminCore API and AdminCore frontend.
+Copy `.env.development.example` to `.env.development.local` in the
+repository root and configure local credentials first.
+MongoDB must be running locally. The launcher refuses remote
+database/API URLs and stops if a required service fails; it never falls back to Render.
+Local and live data are separate. Render records are not automatically copied locally.
+
+Keep `REACT_APP_BACKEND_URL` empty (or unset) so browser requests use `/api`
+and session cookies stay on the same origin. Restart the dev server after
+changing environment settings.
+
+To use a separately running local backend, run `npm run dev:frontend` from the
+repository root. Its development proxy defaults to `http://127.0.0.1:8000`.
+Running `npm start` inside `frontend` uses that same launcher on port 3001.
+In VS Code, select **Open AdminCore** under Run and Debug (F5).
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
@@ -8,8 +27,9 @@ In the project directory, you can run:
 
 ### `npm start`
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+From the repository root this starts the AdminCore API and frontend. Inside
+`frontend`, this starts only the frontend, using the existing API on port 8000.
+Both use [http://localhost:3001](http://localhost:3001).
 
 The page will reload when you make changes.\
 You may also see any lint errors in the console.

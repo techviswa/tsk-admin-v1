@@ -12,7 +12,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useBusiness } from '@/components/layout/DashboardLayout';
-import { Receipt, MoreHorizontal, ArrowUpDown, XCircle, PlayCircle, PauseCircle, MapPin, Users, Blocks, Plug, Building2, CalendarDays } from 'lucide-react';
+import { Receipt, MoreHorizontal, ArrowUpDown, XCircle, PlayCircle, PauseCircle, MapPin, Users, Blocks, Plug, Building2, CalendarDays, Link2, IndianRupee } from 'lucide-react';
 
 const STATUS_COLORS = {
   active: 'bg-emerald-100 text-emerald-700 border-emerald-200',
@@ -50,6 +50,7 @@ export default function SubscriptionsPage() {
   const [entitlements, setEntitlements] = useState(null);
   const [detailBizId, setDetailBizId] = useState(null);
   const [form, setForm] = useState({ plan_id: '', billing_cycle: 'monthly', status: 'active' });
+  const [billing, setBilling] = useState(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -114,6 +115,22 @@ export default function SubscriptionsPage() {
     } catch (err) { toast.error(formatApiError(err)); }
   };
 
+  // Razorpay: a hosted page where the customer sets up UPI Autopay / card mandate for their plan.
+  const createPaymentLink = async (sub) => {
+    try {
+      const { data } = await api.post('/billing/checkout', { business_id: sub.business_id, plan_slug: sub.plan_slug, billing_cycle: sub.billing_cycle || 'monthly' });
+      if (navigator.clipboard) await navigator.clipboard.writeText(data.short_url).catch(() => {});
+      window.prompt(`Payment page for ${sub.business_name} (${sub.plan_name}, ${sub.billing_cycle}). Copied if your browser allowed it; send it to the owner:`, data.short_url);
+    } catch (err) { toast.error(formatApiError(err)); }
+  };
+
+  const viewPayments = async (sub) => {
+    try {
+      const { data } = await api.get('/billing/payments', { params: { business_id: sub.business_id } });
+      setBilling({ sub, payments: data });
+    } catch (err) { toast.error(formatApiError(err)); }
+  };
+
   const unsubscribedBusinesses = businesses.filter(b => !subscriptions.find(s => s.business_id === b.id));
   const limit = (code, legacyCode) => entitlements?.limits?.[code] ?? entitlements?.limits?.[legacyCode] ?? 0;
 
@@ -149,6 +166,33 @@ export default function SubscriptionsPage() {
               <UsageBar label="Modules" used={entitlements.usage?.modules || 0} max={limit('modules.max', 'max_modules')} icon={Blocks} />
               <UsageBar label="Integrations" used={entitlements.usage?.integrations || 0} max={limit('integrations.max', 'max_integrations')} icon={Plug} />
             </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {billing && (
+        <Card className="shadow-sm" data-testid="billing-payments">
+          <CardContent className="p-5">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-zinc-900 font-heading">Razorpay payments: {billing.sub.business_name}</h3>
+              <Button variant="ghost" size="sm" onClick={() => setBilling(null)} className="text-xs">Close</Button>
+            </div>
+            {billing.payments.length === 0 ? <p className="text-sm text-zinc-500">No payments recorded yet.</p> : (
+              <Table>
+                <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Amount</TableHead><TableHead>Period</TableHead><TableHead>Method</TableHead><TableHead>Payment / invoice</TableHead></TableRow></TableHeader>
+                <TableBody>
+                  {billing.payments.map(row => (
+                    <TableRow key={row.payment_id}>
+                      <TableCell className="text-xs">{new Date(row.created_at).toLocaleString()}</TableCell>
+                      <TableCell className="text-sm font-medium">₹{Number(row.amount).toFixed(2)}</TableCell>
+                      <TableCell className="text-xs">{row.period_start ? new Date(row.period_start).toLocaleDateString() : '-'} – {row.period_end ? new Date(row.period_end).toLocaleDateString() : '-'}</TableCell>
+                      <TableCell className="text-xs capitalize">{row.method || '-'}</TableCell>
+                      <TableCell className="text-xs font-mono">{row.payment_id}{row.invoice_id ? ` / ${row.invoice_id}` : ''}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
           </CardContent>
         </Card>
       )}
@@ -192,11 +236,15 @@ export default function SubscriptionsPage() {
               <TableRow key={sub.id} className="hover:bg-zinc-50/50" data-testid={`subscription-row-${sub.business_slug}`}>
                 <TableCell className="font-medium text-zinc-900 py-3">{sub.business_name}</TableCell>
                 <TableCell className="py-3"><Badge variant="outline" className="text-[11px]">{sub.plan_name}</Badge></TableCell>
-                <TableCell className="py-3"><Badge className={`text-[11px] ${STATUS_COLORS[sub.status] || 'bg-zinc-100'}`}>{sub.status}</Badge></TableCell>
+                <TableCell className="py-3">
+                  <Badge className={`text-[11px] ${STATUS_COLORS[sub.status] || 'bg-zinc-100'}`}>{sub.status}</Badge>
+                  {sub.billing_provider === 'razorpay' && sub.billing_provider_id && <Badge variant="outline" className="text-[10px] ml-1">auto-pay{sub.cancel_at_period_end ? ' ending' : ''}</Badge>}
+                  {sub.pending_checkout && <Badge variant="outline" className="text-[10px] ml-1">payment started</Badge>}
+                </TableCell>
                 <TableCell className="text-zinc-600 py-3 text-sm capitalize">{sub.billing_cycle}</TableCell>
                 <TableCell className="text-zinc-500 py-3 text-xs font-mono">{sub.current_period_end ? new Date(sub.current_period_end).toLocaleDateString() : '-'}</TableCell>
                 <TableCell className="text-zinc-700 py-3 text-sm font-medium">
-                  ${sub.plan_pricing?.[sub.billing_cycle] || 0}/{sub.billing_cycle === 'monthly' ? 'mo' : 'yr'}
+                  ₹{sub.plan_pricing?.[sub.billing_cycle] || 0}/{sub.billing_cycle === 'monthly' ? 'mo' : 'yr'}
                 </TableCell>
                 <TableCell className="py-3">
                   <DropdownMenu>
@@ -204,6 +252,8 @@ export default function SubscriptionsPage() {
                     <DropdownMenuContent align="end" className="w-44">
                       <DropdownMenuItem onClick={() => viewEntitlements(sub.business_id)} data-testid={`view-usage-${sub.business_slug}`}><Blocks className="h-3.5 w-3.5 mr-2" />View Usage</DropdownMenuItem>
                       <DropdownMenuItem onClick={() => openEdit(sub)}><ArrowUpDown className="h-3.5 w-3.5 mr-2" />Change Plan</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => createPaymentLink(sub)}><Link2 className="h-3.5 w-3.5 mr-2" />Razorpay payment link</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => viewPayments(sub)}><IndianRupee className="h-3.5 w-3.5 mr-2" />Payments</DropdownMenuItem>
                       {sub.status !== 'active' && <DropdownMenuItem onClick={() => changeStatus(sub, 'active')}><PlayCircle className="h-3.5 w-3.5 mr-2" />Activate</DropdownMenuItem>}
                       {sub.status === 'active' && <DropdownMenuItem onClick={() => changeStatus(sub, 'suspended')}><PauseCircle className="h-3.5 w-3.5 mr-2" />Suspend</DropdownMenuItem>}
                       {sub.status !== 'cancelled' && <DropdownMenuItem onClick={() => changeStatus(sub, 'cancelled')} className="text-red-600 focus:text-red-600"><XCircle className="h-3.5 w-3.5 mr-2" />Cancel</DropdownMenuItem>}

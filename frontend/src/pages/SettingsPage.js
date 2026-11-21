@@ -20,29 +20,34 @@ export default function SettingsPage() {
   const { selectedBusiness } = useBusiness();
   const [settings, setSettings] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [writeError, setWriteError] = useState('');
   const [saving, setSaving] = useState(false);
 
-  const fetchSettings = useCallback(async () => {
+  const fetchSettings = useCallback(async (signal) => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
-      const { data } = await api.get(`/settings/business/${selectedBusiness.id}`);
-      setSettings(data);
-    } catch { toast.error('Failed to load settings'); }
-    finally { setLoading(false); }
+      setError('');
+      const { data } = await api.get(`/settings/business/${selectedBusiness.id}`, { signal });
+      if (!signal?.aborted) setSettings(data);
+    } catch (err) { if (!signal?.aborted) setError(formatApiError(err)); }
+    finally { if (!signal?.aborted) setLoading(false); }
   }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchSettings(); }, [fetchSettings]);
+  useEffect(() => { const controller = new AbortController(); setLoading(true); setSettings([]); fetchSettings(controller.signal); return () => controller.abort(); }, [fetchSettings]);
 
-  const getValue = (key) => settings.find(s => s.key === key)?.value || '';
-  const setValue = (key, value) => setSettings(prev => prev.map(s => s.key === key ? { ...s, value } : s));
+  const getValue = (key) => settings.find(s => s.key === key)?.value ?? '';
+  const setValue = (key, value) => setSettings(prev => prev.some(s => s.key === key) ? prev.map(s => s.key === key ? { ...s, value } : s) : [...prev, { key, value, category: key.endsWith('_notifications') ? 'notifications' : ['primary_color', 'business_tagline'].includes(key) ? 'branding' : 'general' }]);
 
-  const saveSetting = async (key) => {
+  const saveSetting = async (key, value) => {
+    const previous = getValue(key);
+    setWriteError('');
     setSaving(true);
     try {
-      const val = getValue(key);
+      const val = value ?? getValue(key);
       await api.put(`/settings/business/${selectedBusiness.id}/${key}`, { value: val });
       toast.success('Setting saved');
-    } catch (err) { toast.error(formatApiError(err)); }
+    } catch (err) { setSettings(rows => rows.map(row => row.key === key ? { ...row, value: previous } : row)); setWriteError(formatApiError(err)); }
     finally { setSaving(false); }
   };
 
@@ -50,6 +55,7 @@ export default function SettingsPage() {
     setSaving(true);
     try {
       const cats = settings.filter(s => s.category === category);
+      if (!cats.length) { toast.info('Choose a value before saving.'); return; }
       for (const s of cats) {
         await api.put(`/settings/business/${selectedBusiness.id}/${s.key}`, { value: s.value });
       }
@@ -83,7 +89,8 @@ export default function SettingsPage() {
       </div>
       <Switch
         checked={getValue(key) === 'true'}
-        onCheckedChange={v => { setValue(key, String(v)); saveSetting(key); }}
+        disabled={saving || loading || Boolean(error)}
+        onCheckedChange={v => { setValue(key, String(v)); saveSetting(key, String(v)); }}
         data-testid={`setting-toggle-${key}`}
       />
     </div>
@@ -96,9 +103,11 @@ export default function SettingsPage() {
         <p className="text-sm text-zinc-500 mt-0.5">Configuration for {selectedBusiness.name}</p>
       </div>
 
+      {error && <div role="alert" className="rounded border p-3 text-sm text-red-700">Settings could not load: {error} <Button variant="outline" size="sm" onClick={() => fetchSettings()}>Retry</Button></div>}
+      {writeError && <div role="alert" className="rounded border p-3 text-sm text-red-700">The preference change could not be confirmed: {writeError} <Button variant="outline" size="sm" onClick={() => { setWriteError(''); fetchSettings(); }}>Reload saved preferences</Button></div>}
       {loading ? (
         <div className="space-y-4">{[1,2,3].map(i => <div key={i} className="h-32 bg-zinc-200 rounded-lg animate-pulse" />)}</div>
-      ) : (
+      ) : error ? null : (
         <Tabs defaultValue="general" className="space-y-6">
           <TabsList className="bg-zinc-100/80 p-1 h-auto" data-testid="settings-tabs">
             <TabsTrigger value="general" className="data-[state=active]:bg-white data-[state=active]:shadow-sm text-sm py-1.5 px-3">General</TabsTrigger>

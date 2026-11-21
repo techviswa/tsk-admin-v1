@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -27,7 +27,8 @@ class AuthenticatedSyncTests(unittest.IsolatedAsyncioTestCase):
         account = {"id": "admin", "role": "platform_admin", "email": "admin@example.test"}
         target = {"id": "staff", "email": "staff@example.test", "business_ids": ["a", "b"]}
         database = SimpleNamespace(users=SimpleNamespace(find_one=AsyncMock(side_effect=lambda query, *args: account if query.get("id") == "admin" else target)),
-                                   pos_profile_jobs=SimpleNamespace(find_one=AsyncMock(return_value=None)))
+                                   pos_profile_jobs=SimpleNamespace(find_one=AsyncMock(return_value=None)),
+                                   businesses=SimpleNamespace(find=Mock(return_value=SimpleNamespace(to_list=AsyncMock(return_value=[{"id": "a"}, {"id": "b"}])))))
         with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
              patch.object(server, "validate_business_access", new_callable=AsyncMock) as scope, \
              patch.object(server, "require_business_module_enabled", new_callable=AsyncMock), \
@@ -117,7 +118,8 @@ class AuthenticatedSyncTests(unittest.IsolatedAsyncioTestCase):
         account = {"id": "admin", "role": "platform_admin", "email": "admin@example.test"}
         target = {"id": "staff", "role": "staff", "business_ids": ["a"], "email": "staff@example.test", "password_hash": "private-hash"}
         database = SimpleNamespace(users=SimpleNamespace(find_one=AsyncMock(side_effect=lambda query, *args: account if query.get("id") == "admin" else target)),
-                                   businesses=SimpleNamespace(find_one=AsyncMock(return_value={"id": "a"})))
+                                   businesses=SimpleNamespace(find_one=AsyncMock(return_value={"id": "a"}),
+                                       find=Mock(return_value=SimpleNamespace(to_list=AsyncMock(return_value=[{"id": "a"}])))))
         with patch.object(server, "db", database), patch.object(server, "POS_CORE_API_BASE_URL", "https://pos.invalid"), \
              patch.object(server, "require_business_module_enabled", new_callable=AsyncMock), \
              patch.object(server.pos_profile_updates, "enqueue", new_callable=AsyncMock) as enqueue, \

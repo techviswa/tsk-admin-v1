@@ -5,10 +5,32 @@ from unittest.mock import AsyncMock
 from pymongo.errors import DuplicateKeyError
 
 from pos_retry import retry_after_seconds
-from pos_sync_worker import PosSyncWorker, timestamp
+from pos_sync_worker import PosSyncWorker, RejectedSyncUpdate, timestamp
 
 
 class SyncWorkerRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_privacy_worker_only_claims_privacy_jobs_and_uses_priority_order(self):
+        collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value=None))
+        worker = PosSyncWorker(collection, AsyncMock(), resources=('privacy-erasures',))
+        await worker.run_once()
+        self.assertEqual(collection.find_one_and_update.call_args.args[0]['resource'], {'$in': ['privacy-erasures']})
+        self.assertEqual(collection.find_one_and_update.call_args.kwargs['sort'][0], ('priority', -1))
+
+    async def test_confirmed_validation_rejection_is_not_retried(self):
+        collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value={
+            "_id": "job", "resource": "profile", "business_id": "u", "attempts": 1}), update_one=AsyncMock())
+        result = await PosSyncWorker(collection, AsyncMock(side_effect=RejectedSyncUpdate({"message": "Email already exists"}))).run_once()
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["last_error"]["message"], "Email already exists")
+
+    async def test_paused_worker_does_not_claim_jobs_or_use_retry_budget(self):
+        collection = SimpleNamespace(find_one_and_update=AsyncMock())
+        processor = AsyncMock()
+        worker = PosSyncWorker(collection, processor, ready=AsyncMock(return_value=False))
+        self.assertIsNone(await worker.run_once())
+        collection.find_one_and_update.assert_not_awaited()
+        processor.assert_not_awaited()
+
     async def test_recent_list_refresh_reuses_completed_snapshot(self):
         recent = {"id": "pos-snapshot:a:products", "status": "synced", "finished_at": timestamp()}
         collection = SimpleNamespace(find_one=AsyncMock(return_value=recent), find_one_and_update=AsyncMock())

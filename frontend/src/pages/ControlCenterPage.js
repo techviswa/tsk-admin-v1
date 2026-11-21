@@ -11,6 +11,7 @@ import {
   RefreshCw, Shield, Store, Users
 } from 'lucide-react';
 import { POS_ADMIN_NAV } from '@/lib/posAdminNav';
+import FulfillmentModeControls from '@/components/FulfillmentModeControls';
 
 const SAAS_ICONS = {
   businesses: Building2,
@@ -115,6 +116,7 @@ export default function ControlCenterPage() {
         </Button>
       </div>
 
+      <FulfillmentModeControls key={selectedBusiness?.id || 'all'} business={selectedBusiness} />
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         {SUMMARY_CARDS.map(({ key, label, icon: Icon, color, money: isMoney }) => (
           <Card key={key} className="shadow-sm border-zinc-200">

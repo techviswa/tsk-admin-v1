@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "install": "npm --prefix frontend install --legacy-peer-deps",
+    "dev": "node scripts/dev.mjs",
+    "dev:frontend": "node scripts/dev.mjs --frontend-only",
     "build": "npm --prefix frontend run build",
-    "start": "npm --prefix frontend start"
+    "start": "node scripts/dev.mjs"
   }
 }

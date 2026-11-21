@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import api, { clearAuthTokens, setAuthTokens } from '@/lib/api';
+import api, { clearAuthTokens } from '@/lib/api';
 
 const AuthContext = createContext(null);
 
@@ -26,15 +26,31 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { data } = await api.post('/auth/login', { email, password }, { timeout: 90000 });
-    setAuthTokens(data.access_token, data.refresh_token);
+    // MFA-protected accounts get no session from the password alone; the caller must finish with verifyMfa().
+    if (data.mfa_required) return { mfaRequired: true, mfaToken: data.mfa_token };
     const account = data.user || data;
     setUser(account);
     return account;
   };
 
+  const verifyMfa = async (mfaToken, code) => {
+    const { data } = await api.post('/auth/mfa/verify', { mfa_token: mfaToken, code }, { timeout: 90000 });
+    const account = data.user || data;
+    setUser(account);
+    return account;
+  };
+
+  // Re-read the account (permissions, MFA state) without flashing the full-page loader.
+  const refreshUser = useCallback(async () => {
+    try {
+      const { data } = await api.get('/auth/me');
+      setUser(data);
+      return data;
+    } catch { return null; }
+  }, []);
+
   const register = async (email, password, name) => {
     const { data } = await api.post('/auth/register', { email, password, name }, { timeout: 90000 });
-    setAuthTokens(data.access_token, data.refresh_token);
     const account = data.user || data;
     setUser(account);
     return account;
@@ -47,7 +63,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, setUser }}>
+    <AuthContext.Provider value={{ user, loading, login, verifyMfa, register, logout, setUser, refreshUser }}>
       {unavailable ? <div role="alert" style={{ padding: 24 }}><p>AdminCore is temporarily unavailable or waking up. Your saved session has been kept.</p><button onClick={checkAuth}>Try connecting again</button></div> : children}
     </AuthContext.Provider>
   );

@@ -21,16 +21,18 @@ export default function FeatureFlagsPage() {
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ key: '', name: '', description: '', enabled: false });
 
-  const fetchFlags = useCallback(async () => {
+  const [error, setError] = useState('');
+  const fetchFlags = useCallback(async (signal) => {
     if (!selectedBusiness) { setLoading(false); return; }
     try {
-      const { data } = await api.get(`/feature-flags/business/${selectedBusiness.id}`);
-      setFlags(data);
-    } catch { toast.error('Failed to load feature flags'); }
-    finally { setLoading(false); }
+      setError('');
+      const { data } = await api.get(`/feature-flags/business/${selectedBusiness.id}`, { signal });
+      if (!signal?.aborted) setFlags(data);
+    } catch (err) { if (!signal?.aborted) setError(formatApiError(err)); }
+    finally { if (!signal?.aborted) setLoading(false); }
   }, [selectedBusiness]);
 
-  useEffect(() => { setLoading(true); fetchFlags(); }, [fetchFlags]);
+  useEffect(() => { const controller = new AbortController(); setLoading(true); setFlags([]); setSheetOpen(false); fetchFlags(controller.signal); return () => controller.abort(); }, [fetchFlags]);
 
   if (!selectedBusiness) {
     return (
@@ -90,6 +92,7 @@ export default function FeatureFlagsPage() {
       </div>
 
       <div className="bg-white border border-zinc-200 rounded-lg overflow-hidden shadow-sm">
+        {error && <div role="alert" className="p-3 text-sm text-red-700">Feature flags could not load: {error} <Button variant="outline" size="sm" onClick={() => fetchFlags()}>Retry</Button></div>}
         <Table>
           <TableHeader>
             <TableRow className="bg-zinc-50 hover:bg-zinc-50">
@@ -103,7 +106,7 @@ export default function FeatureFlagsPage() {
           <TableBody>
             {loading ? (
               <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-400">Loading...</TableCell></TableRow>
-            ) : flags.length === 0 ? (
+            ) : error ? null : flags.length === 0 ? (
               <TableRow><TableCell colSpan={5} className="text-center py-12 text-zinc-400">No feature flags</TableCell></TableRow>
             ) : flags.map(f => (
               <TableRow key={f.id} className="hover:bg-zinc-50/50">

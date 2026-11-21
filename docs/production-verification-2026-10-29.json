@@ -1,0 +1,59 @@
+{
+  "verified_at_utc": "2026-10-29T14:07:01.696314+00:00",
+  "result": "passed_local_checks",
+  "published_or_deployed": false,
+  "working_tree_fingerprints": {
+    "admincore": {
+      "selected_source_files": 183,
+      "sha256": "7de736d7165879bbe9bbbd87be6cee732a916e55baa3f7d8d90f872c325af453"
+    },
+    "pos": {
+      "selected_source_files": 554,
+      "sha256": "ffb8d2b7ae66a6097a7bae000280b056d44a433c9046244218e1a16bebbd384c"
+    }
+  },
+  "fingerprint_scope": "Sorted Git-listed application source, tests, dependencies/config and public assets. Excludes secrets, docs, build output and ignored files.",
+  "tests": {
+    "admin_backend": 252,
+    "admin_frontend": 23,
+    "pos_frontend": 83,
+    "both_production_builds": "passed"
+  },
+  "combined_release_run": "5eba4e97321142da910261f2c0202868",
+  "populated_kitchen_regression_run": "a2cb3a0a919a4187bbdd8ac59cb16e01",
+  "checks": {
+    "pos_release_suite": "passed",
+    "offline_browser": "passed",
+    "credential_create_and_update_replay": "passed",
+    "multi_till_stock_recovery": "passed",
+    "frozen_exports": "passed",
+    "privacy_erasure_delivery": "passed"
+  },
+  "restore_proof": {
+    "postgres_tables_verified": 63,
+    "mongo_bson_and_index_restore": "passed"
+  },
+  "local": {
+    "admin_ui": "http://localhost:3001",
+    "admin_api_port": 8000,
+    "pos_api_port": 4001,
+    "pos_frontend_started": false,
+    "operation_health": "healthy",
+    "original_business_product_table_ids_retained": true,
+    "counts_unchanged": {
+      "businesses": 3,
+      "users": 27,
+      "outlets": 13,
+      "products": 46,
+      "pos_bills": 9,
+      "pos_tables": 5
+    }
+  },
+  "remaining_release_gates": [
+    "Review/publish both repositories and verify paired CI at exact commits",
+    "Hosted credentials, HTTPS/origins, least-privileged database roles and MFA verification",
+    "Hosted deployment/rollback, backup restoration and alert delivery verification",
+    "Provider approval and actual payment/messaging/printer/device tests",
+    "Business financial-rule approval, including offline repricing/cash differences and device retention"
+  ]
+}
