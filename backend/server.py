@@ -3656,8 +3656,8 @@ async def create_subscription(data: SubscriptionCreate, request: Request):
     existing = await db.subscriptions.find_one({"business_id": data.business_id})
     if existing:
         raise HTTPException(status_code=400, detail="Business already has a subscription. Update it instead.")
-    if data.status not in ("trial", "trialing", "active"):
-        await push_subscription_status_to_pos(data.business_id, data.status, None)
+    # The POS enforces the plan, so it must accept the plan and status before AdminCore records them.
+    await push_admin_plan_to_pos(data.business_id, data.status, None, plan["slug"])
     now_ts = datetime.now(timezone.utc)
     trial_end = (now_ts + timedelta(days=plan.get("trial_days", 14))).isoformat() if data.status == "trial" else None
     period_end = (now_ts + timedelta(days=30 if data.billing_cycle == "monthly" else 365)).isoformat()
@@ -3679,13 +3679,20 @@ async def update_subscription(sub_id: str, data: SubscriptionUpdate, request: Re
     update_data = {k: v for k, v in data.model_dump().items() if v is not None and k != "reason"}
     if "status" in update_data and update_data["status"] not in SUBSCRIPTION_STATUSES:
         raise HTTPException(status_code=400, detail=f"status must be one of: {', '.join(SUBSCRIPTION_STATUSES)}")
-    if "status" in update_data and update_data["status"] != sub.get("status"):
-        # Tell the customer application first; only record what the POS actually accepted.
-        await push_subscription_status_to_pos(sub["business_id"], update_data["status"], update_data.get("current_period_end", sub.get("current_period_end")))
+    plan = None
     if "plan_id" in update_data:
         plan = await db.plans.find_one({"id": update_data["plan_id"]}, {"_id": 0})
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
+    status_changed = "status" in update_data and update_data["status"] != sub.get("status")
+    plan_changed = plan is not None and plan["id"] != sub.get("plan_id")
+    period_end = update_data.get("current_period_end", sub.get("current_period_end"))
+    # Tell the customer application first; only record what the POS actually accepted.
+    if plan_changed:
+        await push_admin_plan_to_pos(sub["business_id"], update_data.get("status", sub.get("status")), period_end, plan["slug"])
+    elif status_changed:
+        await push_subscription_status_to_pos(sub["business_id"], update_data["status"], period_end)
+    if plan is not None:
         update_data["plan_slug"] = plan["slug"]
         await db.businesses.update_one({"id": sub["business_id"]}, {"$set": {"plan": plan["slug"]}})
         await record_subscription_event(sub["business_id"], "PLAN_CHANGED", user, {"from_plan_id": sub.get("plan_id"), "to_plan_id": update_data["plan_id"]})
@@ -5124,6 +5131,15 @@ async def push_billing_state_to_pos(business_id: str, new_subscription_status: s
         return await pos_core_session_request("PUT", f"admincore/tenants/{business['pos_external_id']}/subscription", json=payload, extra_headers=headers, use_login=False)
     except HTTPException as exc:
         raise HTTPException(status_code=502, detail={"code": "POS_TENANT_STATE_NOT_APPLIED", "message": "The POS did not accept the change.", "cause": compact_bridge_error_detail(exc.detail)}) from exc
+
+async def push_admin_plan_to_pos(business_id: str, subscription_status: str, period_end: Optional[str], plan_slug: str):
+    """An administrator's plan choice: the POS must receive the plan itself, not only the subscription status."""
+    business = await db.businesses.find_one({"id": business_id}, {"_id": 0, "pos_external_id": 1, "pos_tenant_id": 1}) or {}
+    linked = bool(POS_CORE_API_BASE_URL and business.get("pos_external_id") and business.get("pos_tenant_id"))
+    if linked and not saas_billing.PLAN_TO_POS.get(plan_slug):
+        raise HTTPException(status_code=400, detail={"code": "PLAN_NOT_AVAILABLE_IN_POS",
+                                                     "message": f"The plan '{plan_slug}' has no POS equivalent, so it cannot be given to a POS-linked business."})
+    return await push_billing_state_to_pos(business_id, subscription_status, period_end, plan_slug)
 
 async def push_business_lifecycle_to_pos(business: dict, new_business_status: str):
     sub = await db.subscriptions.find_one({"business_id": business["id"]}, {"_id": 0, "status": 1, "current_period_end": 1})

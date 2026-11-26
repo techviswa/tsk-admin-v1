@@ -6,7 +6,7 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "https://tsk-admin-v1.onrender.com/api/$1"
+      "destination": "https://tsk-admin-v1-nbbb.onrender.com/api/$1"
     },
     {
       "source": "/(.*)",
